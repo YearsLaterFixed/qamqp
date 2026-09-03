@@ -1,6 +1,5 @@
 #include <QtTest/QtTest>
 
-#include "signalspy.h"
 #include "qamqptestcase.h"
 
 #include "qamqpclient.h"
@@ -245,15 +244,21 @@ void tst_QAMQPExchange::testQueuedPublish()
 
 void tst_QAMQPExchange::publishBeforeChannelOpened()
 {
+    const QString queueName = "test-publish-before-channel-open";
+    QAmqpQueue *queue = client->createQueue(queueName);
+    QVERIFY(waitForSignal(queue, SIGNAL(opened())));
+
+    queue->declare();
+    QVERIFY(waitForSignal(queue, SIGNAL(declared())));
+    QVERIFY(queue->consume(QAmqpQueue::coNoAck));
+    QVERIFY(waitForSignal(queue, SIGNAL(consuming(QString))));
+
     QAmqpExchange *defaultExchange = client->createExchange();
-    QSignalSpy disconnectedSpy(client.data(), SIGNAL(disconnected()));
+    defaultExchange->publish("queued message", queueName);
 
-    defaultExchange->publish("queued message", "unroutable-key");
-    QVERIFY(waitForSignal(defaultExchange, SIGNAL(opened())));
-    QTest::qWait(50);
-
+    QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
+    QCOMPARE(queue->dequeue().payload(), QByteArray("queued message"));
     QVERIFY(client->isConnected());
-    QVERIFY(disconnectedSpy.isEmpty());
 }
 
 QTEST_MAIN(tst_QAMQPExchange)
