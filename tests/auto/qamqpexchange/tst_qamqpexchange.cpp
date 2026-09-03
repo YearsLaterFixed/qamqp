@@ -28,6 +28,7 @@ private Q_SLOTS:
     void passiveDeclareNotFound();
     void cleanupOnDeletion();
     void testQueuedPublish();
+    void publishBeforeChannelOpened();
 
 private:
     QScopedPointer<QAmqpClient> client;
@@ -240,6 +241,19 @@ void tst_QAMQPExchange::testQueuedPublish()
     }
 
     QVERIFY(defaultExchange->waitForConfirms());
+}
+
+void tst_QAMQPExchange::publishBeforeChannelOpened()
+{
+    QAmqpExchange *defaultExchange = client->createExchange();
+    QSignalSpy disconnectedSpy(client.data(), SIGNAL(disconnected()));
+
+    defaultExchange->publish("queued message", "unroutable-key");
+    QVERIFY(waitForSignal(defaultExchange, SIGNAL(opened())));
+    QTest::qWait(50);
+
+    QVERIFY(client->isConnected());
+    QVERIFY(disconnectedSpy.isEmpty());
 }
 
 QTEST_MAIN(tst_QAMQPExchange)
