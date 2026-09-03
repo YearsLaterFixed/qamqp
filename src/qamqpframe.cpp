@@ -250,20 +250,21 @@ void QAmqpFrame::writeAmqpField(QDataStream &s, QAmqpMetaType::ValueType type, c
         break;
     case QAmqpMetaType::ShortString:
     {
-        QString str = value.toString();
-        if (str.length() >= 256) {
-            qAmqpDebug() << Q_FUNC_INFO << "invalid shortstr length: " << str.length();
+        QByteArray bytes = value.toString().toUtf8();
+        if (bytes.length() > 255) {
+            qAmqpDebug() << Q_FUNC_INFO << "shortstr exceeds 255 bytes, truncating: " << bytes.length();
+            bytes.truncate(255);
         }
 
-        s << quint8(str.length());
-        s.writeRawData(str.toUtf8().data(), str.length());
+        s << quint8(bytes.length());
+        s.writeRawData(bytes.constData(), bytes.length());
     }
         break;
     case QAmqpMetaType::LongString:
     {
-        QString str = value.toString();
-        s << quint32(str.length());
-        s.writeRawData(str.toLatin1().data(), str.length());
+        QByteArray bytes = value.toString().toUtf8();
+        s << quint32(bytes.length());
+        s.writeRawData(bytes.constData(), bytes.length());
     }
         break;
     case QAmqpMetaType::Timestamp:

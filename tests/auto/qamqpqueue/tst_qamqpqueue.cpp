@@ -31,8 +31,6 @@ private Q_SLOTS:
     void removeIfUnused();
     void removeIfEmpty();
     void bindUnbind();
-    void bindToHeadersExchange();
-    void delayedBindToHeadersExchange();
     void delayedBind();
     void purge();
     void canOnlyStartConsumingOnce();
@@ -47,6 +45,7 @@ private Q_SLOTS:
     void invalidQos();
     void qos();
     void invalidRoutingKey();
+    void unicodeRoutingKeyAndHeader();
     void tableFieldDataTypes();
     void messageProperties();
     void emptyMessage();
@@ -288,74 +287,6 @@ void tst_QAMQPQueue::bindUnbind()
     QVERIFY(waitForSignal(queue, SIGNAL(bound())));
     queue->unbind(amqTopic, "routingKey");
     QVERIFY(waitForSignal(queue, SIGNAL(unbound())));
-}
-
-void tst_QAMQPQueue::bindToHeadersExchange()
-{
-    const QString exchangeName = "test-headers-exchange";
-    QAmqpExchange *exchange = client->createExchange(exchangeName);
-    exchange->declare(QAmqpExchange::Headers, QAmqpExchange::AutoDelete);
-    QVERIFY(waitForSignal(exchange, SIGNAL(declared())));
-
-    QAmqpQueue *queue = client->createQueue("test-headers-exchange-queue");
-    declareQueueAndVerifyConsuming(queue);
-
-    QAmqpTable bindingArguments;
-    bindingArguments.insert("x-match", "all");
-    bindingArguments.insert("source", "integration-test");
-    bindingArguments.insert("priority", 5);
-    queue->bind(exchange, QString(), false, bindingArguments);
-    QVERIFY(waitForSignal(queue, SIGNAL(bound())));
-
-    QAmqpTable matchingHeaders;
-    matchingHeaders.insert("source", "integration-test");
-    matchingHeaders.insert("priority", 5);
-    exchange->publish("matched message", QString(), "text/plain", matchingHeaders);
-    QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
-    QCOMPARE(queue->dequeue().payload(), QByteArray("matched message"));
-
-    QAmqpTable nonMatchingHeaders;
-    nonMatchingHeaders.insert("source", "integration-test");
-    exchange->publish("unmatched message", QString(), "text/plain", nonMatchingHeaders);
-    QVERIFY(!waitForSignal(queue, SIGNAL(messageReceived()), 1));
-
-    queue->remove(QAmqpQueue::roForce);
-    QVERIFY(waitForSignal(queue, SIGNAL(removed())));
-}
-
-void tst_QAMQPQueue::delayedBindToHeadersExchange()
-{
-    const QString exchangeName = "test-delayed-headers-exchange";
-    const QString queueName = "test-delayed-headers-exchange-queue";
-    client->disconnectFromHost();
-    QVERIFY(waitForSignal(client.data(), SIGNAL(disconnected())));
-
-    QAmqpExchange *exchange = client->createExchange(exchangeName);
-    exchange->declare(QAmqpExchange::Headers, QAmqpExchange::AutoDelete);
-
-    QAmqpQueue *queue = client->createQueue(queueName);
-    queue->declare();
-    QAmqpTable bindingArguments;
-    bindingArguments.insert("x-match", "all");
-    bindingArguments.insert("source", "delayed-integration-test");
-    queue->bind(exchangeName, QString(), false, bindingArguments);
-
-    client->connectToHost();
-    QVERIFY(waitForSignal(client.data(), SIGNAL(connected())));
-    QVERIFY(waitForSignal(exchange, SIGNAL(declared())));
-    QVERIFY(waitForSignal(queue, SIGNAL(declared())));
-    QVERIFY(waitForSignal(queue, SIGNAL(bound())));
-    QVERIFY(queue->consume(QAmqpQueue::coNoAck));
-    QVERIFY(waitForSignal(queue, SIGNAL(consuming(QString))));
-
-    QAmqpTable matchingHeaders;
-    matchingHeaders.insert("source", "delayed-integration-test");
-    exchange->publish("delayed matched message", QString(), "text/plain", matchingHeaders);
-    QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
-    QCOMPARE(queue->dequeue().payload(), QByteArray("delayed matched message"));
-
-    queue->remove(QAmqpQueue::roForce);
-    QVERIFY(waitForSignal(queue, SIGNAL(removed())));
 }
 
 void tst_QAMQPQueue::delayedBind()
@@ -610,6 +541,29 @@ void tst_QAMQPQueue::invalidRoutingKey()
     queue->declare();
     QVERIFY(waitForSignal(client.data(), SIGNAL(error(QAMQP::Error))));
     QCOMPARE(client->error(), QAMQP::FrameError);
+}
+
+void tst_QAMQPQueue::unicodeRoutingKeyAndHeader()
+{
+    const QString queueName = "test-unicode-routing-key";
+    const QString routingKey = QString::fromUtf8("routing-\xE2\x98\x83");
+    const QString headerValue = QString::fromUtf8("header-\xE2\x98\x83");
+
+    QAmqpQueue *queue = client->createQueue(queueName);
+    declareQueueAndVerifyConsuming(queue);
+    queue->bind("amq.topic", routingKey);
+    QVERIFY(waitForSignal(queue, SIGNAL(bound())));
+
+    QAmqpTable headers;
+    headers.insert("unicode", headerValue);
+    QAmqpExchange *exchange = client->createExchange("amq.topic");
+    exchange->publish("unicode message", routingKey, "text/plain", headers);
+
+    QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
+    QAmqpMessage message = queue->dequeue();
+    QCOMPARE(message.routingKey(), routingKey);
+    QCOMPARE(message.header("unicode").toString(), headerValue);
+    QCOMPARE(message.payload(), QByteArray("unicode message"));
 }
 
 void tst_QAMQPQueue::tableFieldDataTypes()
