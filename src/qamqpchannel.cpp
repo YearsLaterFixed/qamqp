@@ -11,6 +11,7 @@ QAmqpChannelPrivate::QAmqpChannelPrivate(QAmqpChannel *q)
     : channelNumber(0),
       opened(false),
       needOpen(true),
+    flowActive(true),
       prefetchSize(0),
       requestedPrefetchSize(0),
       prefetchCount(0),
@@ -129,18 +130,41 @@ void QAmqpChannelPrivate::flow(bool active)
     sendFrame(frame);
 }
 
-// NOTE: not implemented until I can figure out a good way to force the server
-//       to pause the channel in a test. It seems like RabbitMQ just doesn't
-//       care about flow control, preferring rather to use basic.qos
 void QAmqpChannelPrivate::flow(const QAmqpMethodFrame &frame)
 {
-    Q_UNUSED(frame);
+    Q_Q(QAmqpChannel);
     qAmqpDebug("-> channel#flow( channel=%d, name=%s )", channelNumber, qPrintable(name));
+
+    QByteArray data = frame.arguments();
+    QDataStream stream(&data, QIODevice::ReadOnly);
+    QVariant activeValue = QAmqpFrame::readAmqpField(stream, QAmqpMetaType::Boolean);
+    if (stream.status() != QDataStream::Ok)
+        return;
+
+    const bool active = activeValue.toBool();
+    if (flowActive != active) {
+        flowActive = active;
+        Q_EMIT q->flowActiveChanged(active);
+    }
+
+    if (active)
+        Q_EMIT q->resumed();
+    else
+        Q_EMIT q->paused();
+
+    sendFrame(flowOkFrame(channelNumber, active));
 }
 
-void QAmqpChannelPrivate::flowOk()
+QAmqpMethodFrame QAmqpChannelPrivate::flowOkFrame(quint16 channelNumber, bool active)
 {
-    qAmqpDebug("<- channel#flowOk( channel=%d, name=%s )", channelNumber, qPrintable(name));
+    QByteArray arguments;
+    QDataStream stream(&arguments, QIODevice::WriteOnly);
+    QAmqpFrame::writeAmqpField(stream, QAmqpMetaType::ShortShortUint, active ? 1 : 0);
+
+    QAmqpMethodFrame frame(QAmqpFrame::Channel, miFlowOk);
+    frame.setChannel(channelNumber);
+    frame.setArguments(arguments);
+    return frame;
 }
 
 void QAmqpChannelPrivate::flowOk(const QAmqpMethodFrame &frame)
@@ -292,6 +316,12 @@ int QAmqpChannel::channelNumber() const
 {
     Q_D(const QAmqpChannel);
     return d->channelNumber;
+}
+
+bool QAmqpChannel::isFlowActive() const
+{
+    Q_D(const QAmqpChannel);
+    return d->flowActive;
 }
 
 void QAmqpChannel::setName(const QString &name)

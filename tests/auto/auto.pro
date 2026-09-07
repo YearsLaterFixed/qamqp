@@ -3,4 +3,5 @@ SUBDIRS = \
     qamqpclient \
     qamqpexchange \
     qamqpqueue \
-    qamqpchannel
+    qamqpchannel \
+    qamqpflow

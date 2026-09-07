@@ -10,7 +10,7 @@
 #include "qamqpmessage.h"
 
 class QAmqpFramePrivate;
-class QAmqpFrame
+class QAMQP_EXPORT QAmqpFrame
 {
 public:
     static const qint64 HEADER_SIZE = 7;
