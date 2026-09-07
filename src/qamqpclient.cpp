@@ -250,6 +250,13 @@ void QAmqpClientPrivate::_q_readyRead()
         unsigned char headerData[QAmqpFrame::HEADER_SIZE];
         socket->peek((char*)headerData, QAmqpFrame::HEADER_SIZE);
         const quint32 payloadSize = qFromBigEndian<quint32>(headerData + 3);
+
+        // reject an oversized frame before waiting on/buffering any of its payload
+        if (Q_UNLIKELY(payloadSize > quint32(frameMax))) {
+            close(QAMQP::FrameError, "frame size too large");
+            return;
+        }
+
         const qint64 readSize = QAmqpFrame::HEADER_SIZE + payloadSize + QAmqpFrame::FRAME_END_SIZE;
 
         if (socket->bytesAvailable() < readSize)

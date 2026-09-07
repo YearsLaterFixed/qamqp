@@ -304,6 +304,8 @@ QVariant QAmqpTable::readFieldValue(QDataStream &stream, QAmqpMetaType::ValueTyp
         QByteArray data;
         quint32 size = 0;
         stream >> size;
+        if (!QAmqpFrame::validateFieldSize(stream, size))
+            return QVariant();
         data.resize(size);
         stream.readRawData(data.data(), data.size());
 
@@ -322,6 +324,8 @@ QVariant QAmqpTable::readFieldValue(QDataStream &stream, QAmqpMetaType::ValueTyp
         QByteArray bytes;
         quint32 length = 0;
         stream >> length;
+        if (!QAmqpFrame::validateFieldSize(stream, length))
+            return QVariant();
         bytes.resize(length);
         stream.readRawData(bytes.data(), bytes.size());
         return bytes;
