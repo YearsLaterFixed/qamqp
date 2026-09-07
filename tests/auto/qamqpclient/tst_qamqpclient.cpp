@@ -20,6 +20,8 @@ private Q_SLOTS:
     void invalidAuthenticationMechanism();
     void tune();
     void socketError();
+    void invalidUri_data();
+    void invalidUri();
     void validateUri_data();
     void validateUri();
     void issue38();
@@ -193,6 +195,28 @@ void tst_QAMQPClient::socketError()
     client.connectToHost("amqp://127.0.0.1:56725/");
     QVERIFY(waitForSignal(&client, SIGNAL(socketErrorOccurred(QAbstractSocket::SocketError))));
     QCOMPARE(client.socketError(), QAbstractSocket::ConnectionRefusedError);
+}
+
+void tst_QAMQPClient::invalidUri_data()
+{
+    QTest::addColumn<QString>("uri");
+
+    QTest::newRow("unsupported-scheme") << "http://localhost";
+    QTest::newRow("missing-host") << "amqp:///vhost";
+}
+
+void tst_QAMQPClient::invalidUri()
+{
+    QFETCH(QString, uri);
+
+    QAmqpClient client;
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    client.connectToHost(uri);
+
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(client.error(), QAMQP::SyntaxError);
+    QCOMPARE(client.errorString(), QLatin1String("Invalid AMQP URI: expected amqp:// or amqps:// with a host"));
+    QCOMPARE(client.socketState(), QAbstractSocket::UnconnectedState);
 }
 
 void tst_QAMQPClient::validateUri_data()
