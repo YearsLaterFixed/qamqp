@@ -19,6 +19,9 @@ private Q_SLOTS:
     void connectDisconnect();
     void invalidAuthenticationMechanism();
     void tune();
+    void channelMaxNegotiation_data();
+    void channelMaxNegotiation();
+    void channelAllocationLimit();
     void socketError();
     void validateUri_data();
     void validateUri();
@@ -179,12 +182,50 @@ void tst_QAMQPClient::tune()
 
     client.connectToHost();
     QVERIFY(waitForSignal(&client, SIGNAL(connected())));
-    QCOMPARE((int) client.channelMax(), 2047);
+    QCOMPARE((int) client.channelMax(), 15);
     QCOMPARE((int)client.heartbeatDelay(), 600);
     QCOMPARE((int)client.frameMax(), 5000);
 
     client.disconnectFromHost();
     QVERIFY(waitForSignal(&client, SIGNAL(disconnected())));
+}
+
+void tst_QAMQPClient::channelMaxNegotiation_data()
+{
+    QTest::addColumn<quint16>("clientChannelMax");
+    QTest::addColumn<quint16>("serverChannelMax");
+    QTest::addColumn<quint16>("expectedChannelMax");
+
+    QTest::newRow("both-unlimited") << quint16(0) << quint16(0) << quint16(0);
+    QTest::newRow("client-unlimited") << quint16(0) << quint16(10) << quint16(10);
+    QTest::newRow("server-unlimited") << quint16(10) << quint16(0) << quint16(10);
+    QTest::newRow("client-lower") << quint16(10) << quint16(20) << quint16(10);
+    QTest::newRow("server-lower") << quint16(20) << quint16(10) << quint16(10);
+}
+
+void tst_QAMQPClient::channelMaxNegotiation()
+{
+    QFETCH(quint16, clientChannelMax);
+    QFETCH(quint16, serverChannelMax);
+    QFETCH(quint16, expectedChannelMax);
+
+    QCOMPARE(QAmqpClientPrivate::negotiateChannelMax(clientChannelMax, serverChannelMax), expectedChannelMax);
+}
+
+void tst_QAMQPClient::channelAllocationLimit()
+{
+    QAmqpClient client;
+    client.setChannelMax(2);
+
+    QAmqpExchange *exchange = client.createExchange("channel-limit-exchange");
+    QAmqpQueue *queue = client.createQueue("channel-limit-queue");
+    QVERIFY(exchange);
+    QVERIFY(queue);
+    QCOMPARE(exchange->channelNumber(), 1);
+    QCOMPARE(queue->channelNumber(), 2);
+    QVERIFY(!client.createQueue("channel-limit-overflow"));
+    QVERIFY(!client.createExchange("channel-limit-explicit", 3));
+    QVERIFY(!client.createExchange("channel-limit-zero", 0));
 }
 
 void tst_QAMQPClient::socketError()
