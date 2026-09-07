@@ -239,8 +239,7 @@ void QAmqpChannelPrivate::openOk(const QAmqpMethodFrame &)
 
 void QAmqpChannelPrivate::_q_disconnected()
 {
-    if (client)
-        client->d_func()->nextChannelNumber = 0;
+    // Existing channels retain their numbers across reconnects.
     opened = false;
 }
 
