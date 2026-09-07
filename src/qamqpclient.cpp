@@ -24,6 +24,7 @@ QAmqpClientPrivate::QAmqpClientPrivate(QAmqpClient *q)
       connecting(false),
       useSsl(false),
       socket(0),
+      nextChannelNumber(0),
       closed(false),
       connected(false),
       channelMax(0),
