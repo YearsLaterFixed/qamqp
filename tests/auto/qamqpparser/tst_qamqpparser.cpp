@@ -143,13 +143,20 @@ void tst_QAMQPParser::deeplyNestedArray()
     for (int i = 0; i < depth; ++i) {
         QByteArray next;
         QDataStream s(&next, QIODevice::WriteOnly);
+        s << qint8('A');
         s << quint32(current.size());
         s.writeRawData(current.constData(), current.size());
         current = next;
     }
 
-    QDataStream in(current);
+    QByteArray encoded;
+    QDataStream out(&encoded, QIODevice::WriteOnly);
+    out << quint32(current.size());
+    out.writeRawData(current.constData(), current.size());
+
+    QDataStream in(encoded);
     QAmqpTable::readFieldValue(in, QAmqpMetaType::Array); // must not crash
+    QCOMPARE(in.status(), QDataStream::ReadCorruptData);
 }
 
 void tst_QAMQPParser::fuzzReadAmqpField()
