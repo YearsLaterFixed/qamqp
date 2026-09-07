@@ -139,7 +139,17 @@ void QAmqpMethodFrame::readPayload(QDataStream &stream)
     stream >> methodClass_;
     stream >> id_;
 
-    arguments_.resize(size_ - (sizeof(id_) + sizeof(methodClass_)));
+    const qint32 headerSize = qint32(sizeof(id_) + sizeof(methodClass_));
+    if (size_ < headerSize) {
+        // declared frame size smaller than the mandatory methodClass_/id_ fields:
+        // size_ - headerSize would underflow and resize() with a huge/negative value
+        qAmqpDebug() << Q_FUNC_INFO << "method frame size too small:" << size_;
+        stream.setStatus(QDataStream::ReadCorruptData);
+        arguments_.clear();
+        return;
+    }
+
+    arguments_.resize(size_ - headerSize);
     stream.readRawData(arguments_.data(), arguments_.size());
 }
 
@@ -151,6 +161,24 @@ void QAmqpMethodFrame::writePayload(QDataStream &stream) const
 }
 
 //////////////////////////////////////////////////////////////////////////
+
+bool QAmqpFrame::validateFieldSize(QDataStream &s, qint64 size)
+{
+    if (size < 0 || size > AMQP_FRAME_MAX) {
+        qAmqpDebug() << Q_FUNC_INFO << "field size out of range:" << size;
+        s.setStatus(QDataStream::ReadCorruptData);
+        return false;
+    }
+
+    QIODevice *device = s.device();
+    if (device && size > device->bytesAvailable()) {
+        qAmqpDebug() << Q_FUNC_INFO << "field size exceeds available data:" << size;
+        s.setStatus(QDataStream::ReadCorruptData);
+        return false;
+    }
+
+    return true;
+}
 
 QVariant QAmqpFrame::readAmqpField(QDataStream &s, QAmqpMetaType::ValueType type)
 {
@@ -191,6 +219,8 @@ QVariant QAmqpFrame::readAmqpField(QDataStream &s, QAmqpMetaType::ValueType type
         QByteArray buffer;
 
         s >> size;
+        if (!validateFieldSize(s, size))
+            return QVariant();
         buffer.resize(size);
         s.readRawData(buffer.data(), buffer.size());
         return QString::fromLatin1(buffer.data(), size);
@@ -201,6 +231,8 @@ QVariant QAmqpFrame::readAmqpField(QDataStream &s, QAmqpMetaType::ValueType type
         QByteArray buffer;
 
         s >> size;
+        if (!validateFieldSize(s, size))
+            return QVariant();
         buffer.resize(size);
         s.readRawData(buffer.data(), buffer.size());
         return QString::fromUtf8(buffer.data(), buffer.size());
