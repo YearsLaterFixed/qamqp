@@ -47,6 +47,7 @@ private Q_SLOTS:
     void invalidQos();
     void qos();
     void invalidRoutingKey();
+    void unicodeRoutingKeyAndHeader();
     void tableFieldDataTypes();
     void messageProperties();
     void emptyMessage();
@@ -610,6 +611,29 @@ void tst_QAMQPQueue::invalidRoutingKey()
     queue->declare();
     QVERIFY(waitForSignal(client.data(), SIGNAL(error(QAMQP::Error))));
     QCOMPARE(client->error(), QAMQP::FrameError);
+}
+
+void tst_QAMQPQueue::unicodeRoutingKeyAndHeader()
+{
+    const QString queueName = "test-unicode-routing-key";
+    const QString routingKey = QString::fromUtf8("routing-\xE2\x98\x83");
+    const QString headerValue = QString::fromUtf8("header-\xE2\x98\x83");
+
+    QAmqpQueue *queue = client->createQueue(queueName);
+    declareQueueAndVerifyConsuming(queue);
+    queue->bind("amq.topic", routingKey);
+    QVERIFY(waitForSignal(queue, SIGNAL(bound())));
+
+    QAmqpTable headers;
+    headers.insert("unicode", headerValue);
+    QAmqpExchange *exchange = client->createExchange("amq.topic");
+    exchange->publish("unicode message", routingKey, "text/plain", headers);
+
+    QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
+    QAmqpMessage message = queue->dequeue();
+    QCOMPARE(message.routingKey(), routingKey);
+    QCOMPARE(message.header("unicode").toString(), headerValue);
+    QCOMPARE(message.payload(), QByteArray("unicode message"));
 }
 
 void tst_QAMQPQueue::tableFieldDataTypes()
