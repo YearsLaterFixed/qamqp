@@ -932,12 +932,8 @@ void QAmqpClient::ignoreSslErrors(const QList<QSslError> &errors)
 {
     Q_D(QAmqpClient);
 
-    // security-relevant: this disables certificate validation for this connection,
-    // log loudly so it can't silently slip into production
     if (errors.isEmpty()) {
-        qAmqpDebug() << Q_FUNC_INFO
-                     << "ignoring ALL current and future SSL errors for this connection - "
-                        "certificate validation is effectively disabled, do not use in production";
+        qAmqpDebug() << Q_FUNC_INFO << "clearing ignored SSL errors";
     } else {
         foreach (const QSslError &sslError, errors) {
             qAmqpDebug() << Q_FUNC_INFO << "ignoring SSL error:" << sslError.errorString();

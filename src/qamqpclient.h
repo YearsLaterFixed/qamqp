@@ -121,7 +121,7 @@ Q_SIGNALS:
     void sslErrors(const QList<QSslError> &errors);
     
 public Q_SLOTS:
-    // disables certificate validation for the ignored errors (or all errors, if empty); use with care
+    // ignores only the supplied certificate errors; use with care
     void ignoreSslErrors(const QList<QSslError> &errors);
 
 protected:
