@@ -6,7 +6,6 @@
 #include "qamqpclient.h"
 #include "qamqpclient_p.h"
 
-quint16 QAmqpChannelPrivate::nextChannelNumber = 0;
 QAmqpChannelPrivate::QAmqpChannelPrivate(QAmqpChannel *q)
     : channelNumber(0),
       opened(false),
@@ -31,9 +30,10 @@ QAmqpChannelPrivate::~QAmqpChannelPrivate()
 void QAmqpChannelPrivate::init(int channel, QAmqpClient *c)
 {
     client = c;
-    needOpen = (channel <= nextChannelNumber && channel != -1) ? false : true;
-    channelNumber = channel == -1 ? ++nextChannelNumber : channel;
-    nextChannelNumber = qMax(channelNumber, nextChannelNumber);
+    QAmqpClientPrivate *clientPriv = client->d_func();
+    needOpen = (channel <= clientPriv->nextChannelNumber && channel != -1) ? false : true;
+    channelNumber = channel == -1 ? ++clientPriv->nextChannelNumber : channel;
+    clientPriv->nextChannelNumber = qMax(channelNumber, clientPriv->nextChannelNumber);
 }
 
 bool QAmqpChannelPrivate::_q_method(const QAmqpMethodFrame &frame)
@@ -239,7 +239,8 @@ void QAmqpChannelPrivate::openOk(const QAmqpMethodFrame &)
 
 void QAmqpChannelPrivate::_q_disconnected()
 {
-    nextChannelNumber = 0;
+    if (client)
+        client->d_func()->nextChannelNumber = 0;
     opened = false;
 }
 

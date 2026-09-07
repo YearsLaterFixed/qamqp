@@ -93,6 +93,10 @@ public:
     QHash<quint16, QList<QAmqpContentFrameHandler*> > contentHandlerByChannel;
     QHash<quint16, QList<QAmqpContentBodyFrameHandler*> > bodyHandlersByChannel;
 
+    // channel numbers are scoped per-connection; keeping this per-client avoids
+    // cross-connection interference and the data race of a process-wide counter
+    quint16 nextChannelNumber;
+
     // Connection
     bool closed;
     bool connected;
