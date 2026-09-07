@@ -123,14 +123,15 @@ void QAmqpClientPrivate::setPassword(const QString &password)
     }
 }
 
-void QAmqpClientPrivate::parseConnectionString(const QString &uri)
+bool QAmqpClientPrivate::parseConnectionString(const QString &uri)
 {
     QUrl connectionString = QUrl::fromUserInput(uri);
 
-    if (connectionString.scheme() != AMQP_SCHEME &&
-        connectionString.scheme() != AMQP_SSL_SCHEME) {
-        qAmqpDebug() << Q_FUNC_INFO << "invalid scheme: " << connectionString.scheme();
-        return;
+    if (!connectionString.isValid() ||
+        (connectionString.scheme() != AMQP_SCHEME &&
+         connectionString.scheme() != AMQP_SSL_SCHEME) ||
+        connectionString.host().isEmpty()) {
+        return false;
     }
 
     useSsl = (connectionString.scheme() == AMQP_SSL_SCHEME);
@@ -143,6 +144,7 @@ void QAmqpClientPrivate::parseConnectionString(const QString &uri)
     virtualHost = vhost;
     setPassword(connectionString.password());
     setUsername(connectionString.userName());
+    return true;
 }
 
 void QAmqpClientPrivate::_q_connect()
@@ -959,7 +961,12 @@ void QAmqpClient::connectToHost(const QString &uri)
         return;
     }
 
-    d->parseConnectionString(uri);
+    if (!d->parseConnectionString(uri)) {
+        d->error = QAMQP::SyntaxError;
+        d->errorString = QLatin1String("Invalid AMQP URI: expected amqp:// or amqps:// with a host");
+        Q_EMIT error(d->error);
+        return;
+    }
     d->_q_connect();
 }
 

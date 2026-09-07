@@ -41,7 +41,7 @@ public:
     void resetChannelState();
     void setUsername(const QString &username);
     void setPassword(const QString &password);
-    void parseConnectionString(const QString &uri);
+    bool parseConnectionString(const QString &uri);
     void sendFrame(const QAmqpFrame &frame);
 
     void closeConnection();
