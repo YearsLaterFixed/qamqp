@@ -23,6 +23,8 @@ private Q_SLOTS:
     void channelMaxNegotiation();
     void channelAllocationLimit();
     void socketError();
+    void invalidUri_data();
+    void invalidUri();
     void validateUri_data();
     void validateUri();
     void issue38();
@@ -61,14 +63,16 @@ QSslConfiguration tst_QAMQPClient::createSslConfiguration()
 void tst_QAMQPClient::connect()
 {
     QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
     client.connectToHost();
     QVERIFY(waitForSignal(&client, SIGNAL(connected())));
 
     QCOMPARE(client.host(), QLatin1String(AMQP_HOST));
     QCOMPARE(client.port(), quint16(AMQP_PORT));
     QCOMPARE(client.virtualHost(), QLatin1String(AMQP_VHOST));
-    QCOMPARE(client.username(), QLatin1String(AMQP_LOGIN));
-    QCOMPARE(client.password(), QLatin1String(AMQP_PSWD));
+    QCOMPARE(client.username(), QLatin1String("guest"));
+    QCOMPARE(client.password(), QLatin1String("guest"));
     QCOMPARE(client.autoReconnect(), false);
 
     client.disconnectFromHost();
@@ -78,6 +82,8 @@ void tst_QAMQPClient::connect()
 void tst_QAMQPClient::sslConnect()
 {
     QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
     client.setSslConfiguration(createSslConfiguration());
     QObject::connect(&client, SIGNAL(sslErrors(QList<QSslError>)),
                      &client, SLOT(ignoreSslErrors(QList<QSslError>)));
@@ -104,6 +110,8 @@ void tst_QAMQPClient::connectProperties()
 void tst_QAMQPClient::connectHostAddress()
 {
     QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
     client.connectToHost(QHostAddress::LocalHost, 5672);
     QVERIFY(waitForSignal(&client, SIGNAL(connected())));
     client.disconnectFromHost();
@@ -113,6 +121,8 @@ void tst_QAMQPClient::connectHostAddress()
 void tst_QAMQPClient::connectDisconnect()
 {
     QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
     client.connectToHost();
     QVERIFY(waitForSignal(&client, SIGNAL(connected())));
     client.disconnectFromHost();
@@ -142,6 +152,8 @@ void tst_QAMQPClient::autoReconnect()
     //       better alternatives
 
     QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
     client.setAutoReconnect(true);
     client.connectToHost();
     QVERIFY(waitForSignal(&client, SIGNAL(connected())));
@@ -157,6 +169,8 @@ void tst_QAMQPClient::autoReconnectTimeout()
     //       better alternatives
 
     QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
     client.setAutoReconnect(true, 3);
     client.connectToHost();
     QVERIFY(waitForSignal(&client, SIGNAL(connected()), 60));
@@ -176,6 +190,8 @@ void tst_QAMQPClient::autoReconnectTimeout()
 void tst_QAMQPClient::tune()
 {
     QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
     client.setChannelMax(15);
     client.setFrameMax(5000);
     client.setHeartbeatDelay(600);
@@ -236,6 +252,28 @@ void tst_QAMQPClient::socketError()
     QCOMPARE(client.socketError(), QAbstractSocket::ConnectionRefusedError);
 }
 
+void tst_QAMQPClient::invalidUri_data()
+{
+    QTest::addColumn<QString>("uri");
+
+    QTest::newRow("unsupported-scheme") << "http://localhost";
+    QTest::newRow("missing-host") << "amqp:///vhost";
+}
+
+void tst_QAMQPClient::invalidUri()
+{
+    QFETCH(QString, uri);
+
+    QAmqpClient client;
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    client.connectToHost(uri);
+
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(client.error(), QAMQP::SyntaxError);
+    QCOMPARE(client.errorString(), QLatin1String("Invalid AMQP URI: expected amqp:// or amqps:// with a host"));
+    QCOMPARE(client.socketState(), QAbstractSocket::UnconnectedState);
+}
+
 void tst_QAMQPClient::validateUri_data()
 {
     QTest::addColumn<QString>("uri");
@@ -275,7 +313,7 @@ void tst_QAMQPClient::validateUri()
     QAmqpClientPrivate clientPrivate(0);
     // fake init
     clientPrivate.authenticator = QSharedPointer<QAmqpAuthenticator>(
-        new QAmqpPlainAuthenticator(QString::fromLatin1(AMQP_LOGIN), QString::fromLatin1(AMQP_PSWD)));
+        new QAmqpPlainAuthenticator(QString(), QString()));
 
     // test parsing
     clientPrivate.parseConnectionString(uri);
@@ -292,6 +330,8 @@ void tst_QAMQPClient::validateUri()
 void tst_QAMQPClient::issue38_helper(QAmqpClient *client)
 {
     // connect
+    client->setUsername("guest");
+    client->setPassword("guest");
     client->connectToHost();
     QVERIFY(waitForSignal(client, SIGNAL(connected())));
 
@@ -321,6 +361,8 @@ void tst_QAMQPClient::issue38()
 void tst_QAMQPClient::issue38_take2()
 {
     QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
     client.connectToHost();
     QVERIFY(waitForSignal(&client, SIGNAL(connected())));
     QAmqpExchange *exchange = client.createExchange("myexchange");

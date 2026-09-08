@@ -25,6 +25,7 @@ QAmqpClientPrivate::QAmqpClientPrivate(QAmqpClient *q)
       connecting(false),
       useSsl(false),
       socket(0),
+      nextChannelNumber(0),
       closed(false),
       connected(false),
       channelMax(0),
@@ -51,8 +52,10 @@ void QAmqpClientPrivate::init()
     reconnectTimer->setSingleShot(true);
     QObject::connect(reconnectTimer, SIGNAL(timeout()), q, SLOT(_q_connect()));
 
+    // no default credentials: callers must explicitly configure a username/password
+    // (or a custom QAmqpAuthenticator) before connecting
     authenticator = QSharedPointer<QAmqpAuthenticator>(
-        new QAmqpPlainAuthenticator(QString::fromLatin1(AMQP_LOGIN), QString::fromLatin1(AMQP_PSWD)));
+        new QAmqpPlainAuthenticator(QString(), QString()));
 }
 
 void QAmqpClientPrivate::initSocket()
@@ -152,14 +155,15 @@ quint16 QAmqpClientPrivate::negotiateChannelMax(quint16 clientChannelMax, quint1
     return qMin(clientChannelMax, serverChannelMax);
 }
 
-void QAmqpClientPrivate::parseConnectionString(const QString &uri)
+bool QAmqpClientPrivate::parseConnectionString(const QString &uri)
 {
     QUrl connectionString = QUrl::fromUserInput(uri);
 
-    if (connectionString.scheme() != AMQP_SCHEME &&
-        connectionString.scheme() != AMQP_SSL_SCHEME) {
-        qAmqpDebug() << Q_FUNC_INFO << "invalid scheme: " << connectionString.scheme();
-        return;
+    if (!connectionString.isValid() ||
+        (connectionString.scheme() != AMQP_SCHEME &&
+         connectionString.scheme() != AMQP_SSL_SCHEME) ||
+        connectionString.host().isEmpty()) {
+        return false;
     }
 
     useSsl = (connectionString.scheme() == AMQP_SSL_SCHEME);
@@ -172,6 +176,7 @@ void QAmqpClientPrivate::parseConnectionString(const QString &uri)
     virtualHost = vhost;
     setPassword(connectionString.password());
     setUsername(connectionString.userName());
+    return true;
 }
 
 void QAmqpClientPrivate::_q_connect()
@@ -183,6 +188,14 @@ void QAmqpClientPrivate::_q_connect()
         _q_disconnect();
         // We need to explicitly close connection here because either way it will not be closed until we receive closeOk
         closeConnection();
+    }
+
+    if (const QAmqpPlainAuthenticator *a = dynamic_cast<const QAmqpPlainAuthenticator*>(authenticator.data())) {
+        if (a->login().isEmpty()) {
+            qAmqpDebug() << Q_FUNC_INFO
+                         << "connecting with no username/password configured; call setUsername()/setPassword() "
+                            "(or setAuth()) explicitly - there is no default guest/guest credential anymore";
+        }
     }
 
     qAmqpDebug() << "connecting to host: " << host << ", port: " << port;
@@ -282,6 +295,13 @@ void QAmqpClientPrivate::_q_readyRead()
         unsigned char headerData[QAmqpFrame::HEADER_SIZE];
         socket->peek((char*)headerData, QAmqpFrame::HEADER_SIZE);
         const quint32 payloadSize = qFromBigEndian<quint32>(headerData + 3);
+
+        // reject an oversized frame before waiting on/buffering any of its payload
+        if (Q_UNLIKELY(payloadSize > quint32(frameMax))) {
+            close(QAMQP::FrameError, "frame size too large");
+            return;
+        }
+
         const qint64 readSize = QAmqpFrame::HEADER_SIZE + payloadSize + QAmqpFrame::FRAME_END_SIZE;
 
         if (socket->bytesAvailable() < readSize)
@@ -530,7 +550,7 @@ void QAmqpClientPrivate::close(const QAmqpMethodFrame &frame)
     qAmqpDebug("-> connection#close( reply-code=%d, reply-text=%s, class-id=%d, method-id:%d )",
                code, qPrintable(text), classId, methodId);
 
-    QAMQP::Error checkError = static_cast<QAMQP::Error>(code);
+    QAMQP::Error checkError = QAMQP::errorFromCode(code);
     if (checkError != QAMQP::NoError) {
         error = checkError;
         errorString = qPrintable(text);
@@ -961,6 +981,15 @@ QString QAmqpClient::gitVersion()
 void QAmqpClient::ignoreSslErrors(const QList<QSslError> &errors)
 {
     Q_D(QAmqpClient);
+
+    if (errors.isEmpty()) {
+        qAmqpDebug() << Q_FUNC_INFO << "clearing ignored SSL errors";
+    } else {
+        foreach (const QSslError &sslError, errors) {
+            qAmqpDebug() << Q_FUNC_INFO << "ignoring SSL error:" << sslError.errorString();
+        }
+    }
+
     d->socket->ignoreSslErrors(errors);
 }
 
@@ -972,7 +1001,12 @@ void QAmqpClient::connectToHost(const QString &uri)
         return;
     }
 
-    d->parseConnectionString(uri);
+    if (!d->parseConnectionString(uri)) {
+        d->error = QAMQP::SyntaxError;
+        d->errorString = QLatin1String("Invalid AMQP URI: expected amqp:// or amqps:// with a host");
+        Q_EMIT error(d->error);
+        return;
+    }
     d->_q_connect();
 }
 

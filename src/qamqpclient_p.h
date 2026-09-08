@@ -41,7 +41,7 @@ public:
     void resetChannelState();
     void setUsername(const QString &username);
     void setPassword(const QString &password);
-    void parseConnectionString(const QString &uri);
+    bool parseConnectionString(const QString &uri);
     void sendFrame(const QAmqpFrame &frame);
     quint16 allocateChannelNumber(int requestedChannelNumber);
     static quint16 negotiateChannelMax(quint16 clientChannelMax, quint16 serverChannelMax);
@@ -94,6 +94,10 @@ public:
     QHash<quint16, QList<QAmqpMethodFrameHandler*> > methodHandlersByChannel;
     QHash<quint16, QList<QAmqpContentFrameHandler*> > contentHandlerByChannel;
     QHash<quint16, QList<QAmqpContentBodyFrameHandler*> > bodyHandlersByChannel;
+
+    // channel numbers are scoped per-connection; keeping this per-client avoids
+    // cross-connection interference and the data race of a process-wide counter
+    quint16 nextChannelNumber;
 
     // Connection
     bool closed;
