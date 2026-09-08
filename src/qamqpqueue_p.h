@@ -6,7 +6,7 @@
 
 #include "qamqpchannel_p.h"
 
-class QAmqpQueuePrivate: public QAmqpChannelPrivate,
+class QAMQP_EXPORT QAmqpQueuePrivate: public QAmqpChannelPrivate,
                          public QAmqpContentFrameHandler,
                          public QAmqpContentBodyFrameHandler
 {
@@ -28,6 +28,9 @@ public:
 
     QAmqpQueuePrivate(QAmqpQueue *q);
     ~QAmqpQueuePrivate();
+
+    static bool isAcceptableBodySize(qlonglong declaredBodySize);
+    static bool isAcceptableBodyChunk(qlonglong remainingSize, qlonglong chunkSize);
 
     virtual void resetInternalState();
 

@@ -2,6 +2,8 @@
 #include <QRandomGenerator>
 
 #include "qamqpframe_p.h"
+#include "qamqpqueue.h"
+#include "qamqpqueue_p.h"
 #include "qamqptable.h"
 #include "qamqpglobal.h"
 
@@ -24,6 +26,12 @@ private Q_SLOTS:
 
     void truncatedMethodFrame();
     void deeplyNestedArray();
+
+    void messageBodySize_data();
+    void messageBodySize();
+
+    void messageBodyChunk_data();
+    void messageBodyChunk();
 
     void fuzzReadAmqpField();
     void fuzzTableFieldValues();
@@ -192,6 +200,49 @@ void tst_QAMQPParser::deeplyNestedArray()
     QDataStream in(encoded);
     QAmqpTable::readFieldValue(in, QAmqpMetaType::Array); // must not crash
     QCOMPARE(in.status(), QDataStream::ReadCorruptData);
+}
+
+void tst_QAMQPParser::messageBodySize_data()
+{
+    QTest::addColumn<qlonglong>("declaredBodySize");
+    QTest::addColumn<bool>("accepted");
+
+    QTest::newRow("empty") << qlonglong(0) << true;
+    QTest::newRow("small") << qlonglong(1024) << true;
+    QTest::newRow("at-limit") << qlonglong(AMQP_MESSAGE_MAX) << true;
+    QTest::newRow("above-limit") << qlonglong(AMQP_MESSAGE_MAX) + 1 << false;
+    QTest::newRow("huge") << Q_INT64_C(0x7FFFFFFFFFFF) << false;
+    QTest::newRow("negative") << qlonglong(-1) << false;
+}
+
+void tst_QAMQPParser::messageBodySize()
+{
+    QFETCH(qlonglong, declaredBodySize);
+    QFETCH(bool, accepted);
+
+    QCOMPARE(QAmqpQueuePrivate::isAcceptableBodySize(declaredBodySize), accepted);
+}
+
+void tst_QAMQPParser::messageBodyChunk_data()
+{
+    QTest::addColumn<qlonglong>("remainingSize");
+    QTest::addColumn<qlonglong>("chunkSize");
+    QTest::addColumn<bool>("accepted");
+
+    QTest::newRow("exact") << qlonglong(100) << qlonglong(100) << true;
+    QTest::newRow("partial") << qlonglong(100) << qlonglong(40) << true;
+    QTest::newRow("empty-chunk") << qlonglong(100) << qlonglong(0) << true;
+    QTest::newRow("overrun") << qlonglong(100) << qlonglong(101) << false;
+    QTest::newRow("overrun-when-complete") << qlonglong(0) << qlonglong(1) << false;
+}
+
+void tst_QAMQPParser::messageBodyChunk()
+{
+    QFETCH(qlonglong, remainingSize);
+    QFETCH(qlonglong, chunkSize);
+    QFETCH(bool, accepted);
+
+    QCOMPARE(QAmqpQueuePrivate::isAcceptableBodyChunk(remainingSize, chunkSize), accepted);
 }
 
 void tst_QAMQPParser::fuzzReadAmqpField()
