@@ -7,7 +7,7 @@
 #include "qamqpexchange.h"
 #include "qamqpchannel_p.h"
 
-class QAmqpExchangePrivate: public QAmqpChannelPrivate
+class QAMQP_EXPORT QAmqpExchangePrivate: public QAmqpChannelPrivate
 {
 public:
     struct PendingPublish {
@@ -30,11 +30,14 @@ public:
 
     QAmqpExchangePrivate(QAmqpExchange *q);
     static QString typeToString(QAmqpExchange::ExchangeType type);
+    static bool shouldDeferPublish(bool channelOpened, bool flowActive);
 
     virtual void resetInternalState();
+    virtual void flowStateChanged(bool active);
 
     void declare();
     void sendPublish(const PendingPublish &publish);
+    void flushPendingPublishes();
 
     // method handler related
     virtual void _q_disconnected();

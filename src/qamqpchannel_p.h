@@ -10,7 +10,7 @@
 class QAmqpChannel;
 class QAmqpClient;
 class QAmqpClientPrivate;
-class QAmqpChannelPrivate : public QAmqpMethodFrameHandler
+class QAMQP_EXPORT QAmqpChannelPrivate : public QAmqpMethodFrameHandler
 {
 public:
     enum MethodId {
@@ -44,7 +44,8 @@ public:
 
     void open();
     void flow(bool active);
-    void flowOk();
+    static QAmqpMethodFrame flowOkFrame(quint16 channelNumber, bool active);
+    virtual void flowStateChanged(bool active);
     void close(int code, const QString &text, int classId, int methodId);
     void notifyClosed();
 
@@ -66,6 +67,7 @@ public:
     quint16 channelNumber;
     bool opened;
     bool needOpen;
+    bool flowActive;
 
     qint32 prefetchSize;
     qint32 requestedPrefetchSize;

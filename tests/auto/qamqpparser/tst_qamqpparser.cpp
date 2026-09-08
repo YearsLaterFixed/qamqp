@@ -2,6 +2,8 @@
 #include <QRandomGenerator>
 
 #include "qamqpframe_p.h"
+#include "qamqpqueue.h"
+#include "qamqpqueue_p.h"
 #include "qamqptable.h"
 #include "qamqpglobal.h"
 
@@ -19,8 +21,17 @@ private Q_SLOTS:
     void fieldSizeBoundaries_data();
     void fieldSizeBoundaries();
 
+    void utf8StringRoundTrip_data();
+    void utf8StringRoundTrip();
+
     void truncatedMethodFrame();
     void deeplyNestedArray();
+
+    void messageBodySize_data();
+    void messageBodySize();
+
+    void messageBodyChunk_data();
+    void messageBodyChunk();
 
     void fuzzReadAmqpField();
     void fuzzTableFieldValues();
@@ -108,6 +119,38 @@ void tst_QAMQPParser::fieldSizeBoundaries()
     }
 }
 
+void tst_QAMQPParser::utf8StringRoundTrip_data()
+{
+    QTest::addColumn<QString>("text");
+
+    // non-ASCII rows are built from explicit UTF-8 bytes so the test does not
+    // depend on the encoding of this source file
+    QTest::newRow("ascii") << QString::fromUtf8("plain-ascii");
+    // split literal keeps the hex escape from greedily consuming the following 'e'
+    QTest::newRow("latin1-supplement") << QString::fromUtf8("Gr\xC3\xBC\xC3\x9F" "e");
+    QTest::newRow("cyrillic") << QString::fromUtf8("\xD0\xBE\xD1\x87\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB4\xD1\x8C");
+    QTest::newRow("cjk") << QString::fromUtf8("\xE9\x98\x9F\xE5\x88\x97");
+    QTest::newRow("non-bmp") << QString::fromUtf8("queue \xF0\x9F\x9A\x80");
+}
+
+void tst_QAMQPParser::utf8StringRoundTrip()
+{
+    QFETCH(QString, text);
+
+    const QVector<QAmqpMetaType::ValueType> types = {
+        QAmqpMetaType::ShortString, QAmqpMetaType::LongString
+    };
+
+    foreach (QAmqpMetaType::ValueType type, types) {
+        QByteArray buffer;
+        QDataStream out(&buffer, QIODevice::WriteOnly);
+        QAmqpFrame::writeAmqpField(out, type, text);
+
+        QDataStream in(buffer);
+        QCOMPARE(QAmqpFrame::readAmqpField(in, type).toString(), text);
+    }
+}
+
 void tst_QAMQPParser::truncatedMethodFrame()
 {
     // a Method frame body must contain at least methodClass_+id_ (4 bytes); a
@@ -157,6 +200,49 @@ void tst_QAMQPParser::deeplyNestedArray()
     QDataStream in(encoded);
     QAmqpTable::readFieldValue(in, QAmqpMetaType::Array); // must not crash
     QCOMPARE(in.status(), QDataStream::ReadCorruptData);
+}
+
+void tst_QAMQPParser::messageBodySize_data()
+{
+    QTest::addColumn<qlonglong>("declaredBodySize");
+    QTest::addColumn<bool>("accepted");
+
+    QTest::newRow("empty") << qlonglong(0) << true;
+    QTest::newRow("small") << qlonglong(1024) << true;
+    QTest::newRow("at-limit") << qlonglong(AMQP_MESSAGE_MAX) << true;
+    QTest::newRow("above-limit") << qlonglong(AMQP_MESSAGE_MAX) + 1 << false;
+    QTest::newRow("huge") << Q_INT64_C(0x7FFFFFFFFFFF) << false;
+    QTest::newRow("negative") << qlonglong(-1) << false;
+}
+
+void tst_QAMQPParser::messageBodySize()
+{
+    QFETCH(qlonglong, declaredBodySize);
+    QFETCH(bool, accepted);
+
+    QCOMPARE(QAmqpQueuePrivate::isAcceptableBodySize(declaredBodySize), accepted);
+}
+
+void tst_QAMQPParser::messageBodyChunk_data()
+{
+    QTest::addColumn<qlonglong>("remainingSize");
+    QTest::addColumn<qlonglong>("chunkSize");
+    QTest::addColumn<bool>("accepted");
+
+    QTest::newRow("exact") << qlonglong(100) << qlonglong(100) << true;
+    QTest::newRow("partial") << qlonglong(100) << qlonglong(40) << true;
+    QTest::newRow("empty-chunk") << qlonglong(100) << qlonglong(0) << true;
+    QTest::newRow("overrun") << qlonglong(100) << qlonglong(101) << false;
+    QTest::newRow("overrun-when-complete") << qlonglong(0) << qlonglong(1) << false;
+}
+
+void tst_QAMQPParser::messageBodyChunk()
+{
+    QFETCH(qlonglong, remainingSize);
+    QFETCH(qlonglong, chunkSize);
+    QFETCH(bool, accepted);
+
+    QCOMPARE(QAmqpQueuePrivate::isAcceptableBodyChunk(remainingSize, chunkSize), accepted);
 }
 
 void tst_QAMQPParser::fuzzReadAmqpField()

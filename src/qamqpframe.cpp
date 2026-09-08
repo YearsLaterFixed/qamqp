@@ -220,7 +220,7 @@ QVariant QAmqpFrame::readAmqpField(QDataStream &s, QAmqpMetaType::ValueType type
             return QVariant();
         buffer.resize(size);
         s.readRawData(buffer.data(), buffer.size());
-        return QString::fromLatin1(buffer.data(), size);
+        return QString::fromUtf8(buffer.data(), buffer.size());
     }
     case QAmqpMetaType::LongString:
     {

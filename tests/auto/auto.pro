@@ -4,4 +4,5 @@ SUBDIRS = \
     qamqpexchange \
     qamqpqueue \
     qamqpchannel \
-    qamqpparser
+    qamqpparser \
+    qamqpflow
