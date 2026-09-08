@@ -75,11 +75,8 @@ QDataStream &operator<<(QDataStream &stream, const QAmqpFrame &frame)
     // write end
     stream << qint8(QAmqpFrame::FRAME_END);
     
-    int writeTimeout = QAmqpFrame::writeTimeout();
-    if(writeTimeout >= -1)
-    {
-        stream.device()->waitForBytesWritten(writeTimeout);
-    }
+    // rely on Qt's async write buffering (QIODevice::bytesWritten()) instead of
+    // blocking the event loop here; writeTimeout is kept only for API compatibility
 
     return stream;
 }
@@ -215,7 +212,7 @@ QVariant QAmqpFrame::readAmqpField(QDataStream &s, QAmqpMetaType::ValueType type
     }
     case QAmqpMetaType::ShortString:
     {
-        qint8 size = 0;
+        quint8 size = 0;
         QByteArray buffer;
 
         s >> size;
@@ -223,7 +220,7 @@ QVariant QAmqpFrame::readAmqpField(QDataStream &s, QAmqpMetaType::ValueType type
             return QVariant();
         buffer.resize(size);
         s.readRawData(buffer.data(), buffer.size());
-        return QString::fromLatin1(buffer.data(), size);
+        return QString::fromUtf8(buffer.data(), buffer.size());
     }
     case QAmqpMetaType::LongString:
     {
@@ -282,20 +279,21 @@ void QAmqpFrame::writeAmqpField(QDataStream &s, QAmqpMetaType::ValueType type, c
         break;
     case QAmqpMetaType::ShortString:
     {
-        QString str = value.toString();
-        if (str.length() >= 256) {
-            qAmqpDebug() << Q_FUNC_INFO << "invalid shortstr length: " << str.length();
+        QByteArray bytes = value.toString().toUtf8();
+        if (bytes.length() > 255) {
+            qAmqpDebug() << Q_FUNC_INFO << "shortstr exceeds 255 bytes, truncating: " << bytes.length();
+            bytes.truncate(255);
         }
 
-        s << quint8(str.length());
-        s.writeRawData(str.toUtf8().data(), str.length());
+        s << quint8(bytes.length());
+        s.writeRawData(bytes.constData(), bytes.length());
     }
         break;
     case QAmqpMetaType::LongString:
     {
-        QString str = value.toString();
-        s << quint32(str.length());
-        s.writeRawData(str.toLatin1().data(), str.length());
+        QByteArray bytes = value.toString().toUtf8();
+        s << quint32(bytes.length());
+        s.writeRawData(bytes.constData(), bytes.length());
     }
         break;
     case QAmqpMetaType::Timestamp:
