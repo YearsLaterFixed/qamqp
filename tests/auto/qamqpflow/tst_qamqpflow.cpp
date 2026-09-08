@@ -2,6 +2,7 @@
 
 #include "qamqpchannel.h"
 #include "qamqpchannel_p.h"
+#include "qamqpexchange_p.h"
 
 class TestChannel : public QAmqpChannel
 {
@@ -20,6 +21,12 @@ public:
         d->_q_method(frame);
     }
 
+    void resetState()
+    {
+        Q_D(QAmqpChannel);
+        d->resetInternalState();
+    }
+
 protected:
     virtual void channelOpened() {}
     virtual void channelClosed() {}
@@ -30,6 +37,9 @@ class tst_QAMQPFlow : public QObject
     Q_OBJECT
 private Q_SLOTS:
     void serverInitiatedFlow();
+    void publishDeferral_data();
+    void publishDeferral();
+    void flowStateResetOnReconnect();
 };
 
 void tst_QAMQPFlow::serverInitiatedFlow()
@@ -69,6 +79,51 @@ void tst_QAMQPFlow::serverInitiatedFlow()
     QVERIFY(channel.isFlowActive());
     QCOMPARE(paused.count(), 1);
     QCOMPARE(resumed.count(), 1);
+}
+
+static QAmqpMethodFrame flowFrame(quint16 channelNumber, bool active)
+{
+    QAmqpMethodFrame frame(QAmqpFrame::Channel, QAmqpChannelPrivate::miFlow);
+    frame.setChannel(channelNumber);
+
+    QByteArray arguments;
+    QDataStream stream(&arguments, QIODevice::WriteOnly);
+    QAmqpFrame::writeAmqpField(stream, QAmqpMetaType::ShortShortUint, active ? 1 : 0);
+    frame.setArguments(arguments);
+    return frame;
+}
+
+void tst_QAMQPFlow::publishDeferral_data()
+{
+    QTest::addColumn<bool>("channelOpened");
+    QTest::addColumn<bool>("flowActive");
+    QTest::addColumn<bool>("deferred");
+
+    QTest::newRow("open-and-active") << true << true << false;
+    QTest::newRow("open-but-paused") << true << false << true;
+    QTest::newRow("not-open-active") << false << true << true;
+    QTest::newRow("not-open-paused") << false << false << true;
+}
+
+void tst_QAMQPFlow::publishDeferral()
+{
+    QFETCH(bool, channelOpened);
+    QFETCH(bool, flowActive);
+    QFETCH(bool, deferred);
+
+    QCOMPARE(QAmqpExchangePrivate::shouldDeferPublish(channelOpened, flowActive), deferred);
+}
+
+void tst_QAMQPFlow::flowStateResetOnReconnect()
+{
+    TestChannel channel;
+    channel.receiveMethod(flowFrame(channel.channelNumber(), false));
+    QVERIFY(!channel.isFlowActive());
+
+    // a reconnected channel starts out active again, otherwise publishes would
+    // stay queued forever waiting for a channel.flow that never arrives
+    channel.resetState();
+    QVERIFY(channel.isFlowActive());
 }
 
 QTEST_APPLESS_MAIN(tst_QAMQPFlow)
