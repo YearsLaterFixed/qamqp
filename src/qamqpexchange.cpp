@@ -384,9 +384,15 @@ void QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
     sendFrame(content);
 
     int fullSize = publish.message.size();
-    for (int sent = 0; sent < fullSize; sent += (client->frameMax() - 7)) {
+    // frame-max bounds the entire frame, so a body chunk must leave room for the
+    // header and the frame-end octet; zero means the broker imposed no limit
+    const int frameOverhead = int(QAmqpFrame::HEADER_SIZE + QAmqpFrame::FRAME_END_SIZE);
+    const int chunkSize = client->frameMax() > frameOverhead
+                              ? client->frameMax() - frameOverhead
+                              : fullSize;
+    for (int sent = 0; sent < fullSize; sent += chunkSize) {
         QAmqpContentBodyFrame body;
-        QByteArray partition = publish.message.mid(sent, (client->frameMax() - 7));
+        QByteArray partition = publish.message.mid(sent, chunkSize);
         body.setChannel(channelNumber);
         body.setBody(partition);
         sendFrame(body);
