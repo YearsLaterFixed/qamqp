@@ -19,6 +19,9 @@ private Q_SLOTS:
     void fieldSizeBoundaries_data();
     void fieldSizeBoundaries();
 
+    void utf8StringRoundTrip_data();
+    void utf8StringRoundTrip();
+
     void truncatedMethodFrame();
     void deeplyNestedArray();
 
@@ -105,6 +108,38 @@ void tst_QAMQPParser::fieldSizeBoundaries()
         QVERIFY(!result.isValid() || result.toString().isEmpty());
     } else {
         QCOMPARE(quint32(result.toString().toUtf8().size()), declaredSize);
+    }
+}
+
+void tst_QAMQPParser::utf8StringRoundTrip_data()
+{
+    QTest::addColumn<QString>("text");
+
+    // non-ASCII rows are built from explicit UTF-8 bytes so the test does not
+    // depend on the encoding of this source file
+    QTest::newRow("ascii") << QString::fromUtf8("plain-ascii");
+    // split literal keeps the hex escape from greedily consuming the following 'e'
+    QTest::newRow("latin1-supplement") << QString::fromUtf8("Gr\xC3\xBC\xC3\x9F" "e");
+    QTest::newRow("cyrillic") << QString::fromUtf8("\xD0\xBE\xD1\x87\xD0\xB5\xD1\x80\xD0\xB5\xD0\xB4\xD1\x8C");
+    QTest::newRow("cjk") << QString::fromUtf8("\xE9\x98\x9F\xE5\x88\x97");
+    QTest::newRow("non-bmp") << QString::fromUtf8("queue \xF0\x9F\x9A\x80");
+}
+
+void tst_QAMQPParser::utf8StringRoundTrip()
+{
+    QFETCH(QString, text);
+
+    const QVector<QAmqpMetaType::ValueType> types = {
+        QAmqpMetaType::ShortString, QAmqpMetaType::LongString
+    };
+
+    foreach (QAmqpMetaType::ValueType type, types) {
+        QByteArray buffer;
+        QDataStream out(&buffer, QIODevice::WriteOnly);
+        QAmqpFrame::writeAmqpField(out, type, text);
+
+        QDataStream in(buffer);
+        QCOMPARE(QAmqpFrame::readAmqpField(in, type).toString(), text);
     }
 }
 
