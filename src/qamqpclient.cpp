@@ -154,6 +154,38 @@ quint16 QAmqpClientPrivate::negotiateChannelMax(quint16 clientChannelMax, quint1
     return qMin(clientChannelMax, serverChannelMax);
 }
 
+qint32 QAmqpClientPrivate::negotiateFrameMax(qint32 clientFrameMax, qint32 serverFrameMax)
+{
+    qint32 negotiated = 0;
+    if (!clientFrameMax)
+        negotiated = serverFrameMax;
+    else if (!serverFrameMax)
+        negotiated = clientFrameMax;
+    else
+        negotiated = qMin(clientFrameMax, serverFrameMax);
+
+    // zero keeps the "no limit" meaning; anything else must honour the AMQP floor
+    if (negotiated && negotiated < AMQP_FRAME_MIN_SIZE)
+        negotiated = AMQP_FRAME_MIN_SIZE;
+
+    return negotiated;
+}
+
+qint16 QAmqpClientPrivate::negotiateHeartbeat(qint16 clientHeartbeat, qint16 serverHeartbeat)
+{
+    // a negative delay can only come from a malformed tune frame; treat it as disabled
+    if (clientHeartbeat < 0)
+        clientHeartbeat = 0;
+    if (serverHeartbeat < 0)
+        serverHeartbeat = 0;
+
+    if (!clientHeartbeat)
+        return serverHeartbeat;
+    if (!serverHeartbeat)
+        return clientHeartbeat;
+    return qMin(clientHeartbeat, serverHeartbeat);
+}
+
 bool QAmqpClientPrivate::parseConnectionString(const QString &uri)
 {
     QUrl connectionString = QUrl::fromUserInput(uri);
@@ -499,10 +531,9 @@ void QAmqpClientPrivate::tune(const QAmqpMethodFrame &frame)
     stream >> frame_max;
     stream >> heartbeat_delay;
 
-    if (!frameMax)
-        frameMax = frame_max;
+    frameMax = negotiateFrameMax(frameMax, frame_max);
     channelMax = negotiateChannelMax(channelMax, channel_max);
-    heartbeatDelay = !heartbeatDelay ? heartbeat_delay: heartbeatDelay;
+    heartbeatDelay = negotiateHeartbeat(heartbeatDelay, qint16(heartbeat_delay));
 
     qAmqpDebug("-> connection#tune( channel_max=%d, frame_max=%d, heartbeat=%d )",
                channelMax, frameMax, heartbeatDelay);
