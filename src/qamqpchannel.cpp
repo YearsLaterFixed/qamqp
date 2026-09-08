@@ -93,6 +93,7 @@ void QAmqpChannelPrivate::sendFrame(const QAmqpFrame &frame)
 
 void QAmqpChannelPrivate::resetInternalState()
 {
+    flowActive = true;
     if (!opened) return;
     opened = false;
     needOpen = true;
@@ -153,6 +154,7 @@ void QAmqpChannelPrivate::flow(const QAmqpMethodFrame &frame)
         Q_EMIT q->paused();
 
     sendFrame(flowOkFrame(channelNumber, active));
+    flowStateChanged(active);
 }
 
 QAmqpMethodFrame QAmqpChannelPrivate::flowOkFrame(quint16 channelNumber, bool active)
@@ -165,6 +167,11 @@ QAmqpMethodFrame QAmqpChannelPrivate::flowOkFrame(quint16 channelNumber, bool ac
     frame.setChannel(channelNumber);
     frame.setArguments(arguments);
     return frame;
+}
+
+void QAmqpChannelPrivate::flowStateChanged(bool active)
+{
+    Q_UNUSED(active)
 }
 
 void QAmqpChannelPrivate::flowOk(const QAmqpMethodFrame &frame)

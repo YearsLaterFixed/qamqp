@@ -38,6 +38,29 @@ void QAmqpExchangePrivate::resetInternalState()
     nextDeliveryTag = 0;
 }
 
+bool QAmqpExchangePrivate::shouldDeferPublish(bool channelOpened, bool flowActive)
+{
+    return !channelOpened || !flowActive;
+}
+
+void QAmqpExchangePrivate::flowStateChanged(bool active)
+{
+    if (active)
+        flushPendingPublishes();
+}
+
+void QAmqpExchangePrivate::flushPendingPublishes()
+{
+    if (shouldDeferPublish(opened, flowActive))
+        return;
+
+    while (!pendingPublishes.isEmpty()) {
+        PendingPublish publish = pendingPublishes.dequeue();
+        pendingPublishBytes -= publish.message.size();
+        sendPublish(publish);
+    }
+}
+
 void QAmqpExchangePrivate::declare()
 {
     if (!opened) {
@@ -218,11 +241,7 @@ void QAmqpExchange::channelOpened()
     if (d->delayedDeclare)
         d->declare();
 
-    while (!d->pendingPublishes.isEmpty()) {
-        QAmqpExchangePrivate::PendingPublish publish = d->pendingPublishes.dequeue();
-        d->pendingPublishBytes -= publish.message.size();
-        d->sendPublish(publish);
-    }
+    d->flushPendingPublishes();
 }
 
 void QAmqpExchange::channelClosed()
@@ -308,8 +327,9 @@ void QAmqpExchange::publish(const QByteArray &message, const QString &routingKey
     publish.properties = properties;
     publish.publishOptions = publishOptions;
 
-    if (!d->opened) {
-        // Bound pending publishes so a permanently unavailable broker cannot exhaust memory.
+    if (QAmqpExchangePrivate::shouldDeferPublish(d->opened, d->flowActive)) {
+        // Bound pending publishes so an unavailable broker, or one that has paused
+        // the channel via channel.flow, cannot exhaust memory.
         if (d->pendingPublishes.size() >= 1000 ||
             d->pendingPublishBytes + message.size() > 16 * 1024 * 1024) {
             qAmqpDebug() << Q_FUNC_INFO << "pending publish limit reached, dropping message";
