@@ -44,6 +44,16 @@ void QAmqpQueuePrivate::resetInternalState()
     consumeRequested = false;
 }
 
+bool QAmqpQueuePrivate::isAcceptableBodySize(qlonglong declaredBodySize)
+{
+    return declaredBodySize >= 0 && declaredBodySize <= AMQP_MESSAGE_MAX;
+}
+
+bool QAmqpQueuePrivate::isAcceptableBodyChunk(qlonglong remainingSize, qlonglong chunkSize)
+{
+    return chunkSize >= 0 && chunkSize <= remainingSize;
+}
+
 bool QAmqpQueuePrivate::_q_method(const QAmqpMethodFrame &frame)
 {
     Q_Q(QAmqpQueue);
@@ -109,6 +119,13 @@ void QAmqpQueuePrivate::_q_content(const QAmqpContentFrame &frame)
         return;
     }
 
+    if (!isAcceptableBodySize(frame.bodySize())) {
+        qAmqpDebug() << Q_FUNC_INFO << "rejecting message, declared body size out of range:"
+                     << frame.bodySize();
+        currentMessage = QAmqpMessage();
+        return;
+    }
+
     currentMessage.d->leftSize = frame.bodySize();
     QAmqpMessage::PropertyHash::ConstIterator it;
     QAmqpMessage::PropertyHash::ConstIterator itEnd = frame.properties_.constEnd();
@@ -135,6 +152,12 @@ void QAmqpQueuePrivate::_q_body(const QAmqpContentBodyFrame &frame)
 
     if (!currentMessage.isValid()) {
         qAmqpDebug() << "received content-body without delivered message";
+        return;
+    }
+
+    if (!isAcceptableBodyChunk(currentMessage.d->leftSize, frame.body().size())) {
+        qAmqpDebug() << Q_FUNC_INFO << "discarding message, body frame overruns declared size";
+        currentMessage = QAmqpMessage();
         return;
     }
 

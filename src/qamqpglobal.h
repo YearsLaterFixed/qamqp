@@ -29,6 +29,9 @@
 
 #define AMQP_FRAME_MAX 131072
 #define AMQP_FRAME_MIN_SIZE 4096
+// upper bound for a reassembled message body; the declared size arrives from the
+// broker and must be bounded before body frames are accumulated
+#define AMQP_MESSAGE_MAX (128 * 1024 * 1024)
 
 #define AMQP_BASIC_CONTENT_TYPE_FLAG (1 << 15)
 #define AMQP_BASIC_CONTENT_ENCODING_FLAG (1 << 14)
