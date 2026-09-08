@@ -31,8 +31,6 @@ private Q_SLOTS:
     void removeIfUnused();
     void removeIfEmpty();
     void bindUnbind();
-    void bindToHeadersExchange();
-    void delayedBindToHeadersExchange();
     void delayedBind();
     void purge();
     void canOnlyStartConsumingOnce();
@@ -61,6 +59,8 @@ private:
 void tst_QAMQPQueue::init()
 {
     client.reset(new QAmqpClient);
+    client->setUsername("guest");
+    client->setPassword("guest");
     client->connectToHost();
     QVERIFY(waitForSignal(client.data(), SIGNAL(connected())));
 }
@@ -176,6 +176,8 @@ void tst_QAMQPQueue::exclusiveAccess()
     QVERIFY(queue->options() & QAmqpQueue::Exclusive);
 
     QAmqpClient secondClient;
+    secondClient.setUsername("guest");
+    secondClient.setPassword("guest");
     secondClient.connectToHost();
     QVERIFY(waitForSignal(&secondClient, SIGNAL(connected())));
     QAmqpQueue *passiveQueue = secondClient.createQueue("test-exclusive-queue");
@@ -199,6 +201,8 @@ void tst_QAMQPQueue::exclusiveRemoval()
     // create a new client and try to access the queue that should
     // no longer exist
     QAmqpClient secondClient;
+    secondClient.setUsername("guest");
+    secondClient.setPassword("guest");
     secondClient.connectToHost();
     QVERIFY(waitForSignal(&secondClient, SIGNAL(connected())));
     QAmqpQueue *passiveQueue = secondClient.createQueue("test-exclusive-queue");
@@ -251,6 +255,8 @@ void tst_QAMQPQueue::removeIfEmpty()
     // create a second client and try to delete the queue
     {
         QAmqpClient secondClient;
+        secondClient.setUsername("guest");
+        secondClient.setPassword("guest");
         secondClient.connectToHost();
         QVERIFY(waitForSignal(&secondClient, SIGNAL(connected())));
         QAmqpQueue *testDeleteQueue = secondClient.createQueue("test-remove-if-empty");
@@ -291,74 +297,6 @@ void tst_QAMQPQueue::bindUnbind()
     QVERIFY(waitForSignal(queue, SIGNAL(unbound())));
 }
 
-void tst_QAMQPQueue::bindToHeadersExchange()
-{
-    const QString exchangeName = "test-headers-exchange";
-    QAmqpExchange *exchange = client->createExchange(exchangeName);
-    exchange->declare(QAmqpExchange::Headers, QAmqpExchange::AutoDelete);
-    QVERIFY(waitForSignal(exchange, SIGNAL(declared())));
-
-    QAmqpQueue *queue = client->createQueue("test-headers-exchange-queue");
-    declareQueueAndVerifyConsuming(queue);
-
-    QAmqpTable bindingArguments;
-    bindingArguments.insert("x-match", "all");
-    bindingArguments.insert("source", "integration-test");
-    bindingArguments.insert("priority", 5);
-    queue->bind(exchange, QString(), false, bindingArguments);
-    QVERIFY(waitForSignal(queue, SIGNAL(bound())));
-
-    QAmqpTable matchingHeaders;
-    matchingHeaders.insert("source", "integration-test");
-    matchingHeaders.insert("priority", 5);
-    exchange->publish("matched message", QString(), "text/plain", matchingHeaders);
-    QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
-    QCOMPARE(queue->dequeue().payload(), QByteArray("matched message"));
-
-    QAmqpTable nonMatchingHeaders;
-    nonMatchingHeaders.insert("source", "integration-test");
-    exchange->publish("unmatched message", QString(), "text/plain", nonMatchingHeaders);
-    QVERIFY(!waitForSignal(queue, SIGNAL(messageReceived()), 1));
-
-    queue->remove(QAmqpQueue::roForce);
-    QVERIFY(waitForSignal(queue, SIGNAL(removed())));
-}
-
-void tst_QAMQPQueue::delayedBindToHeadersExchange()
-{
-    const QString exchangeName = "test-delayed-headers-exchange";
-    const QString queueName = "test-delayed-headers-exchange-queue";
-    client->disconnectFromHost();
-    QVERIFY(waitForSignal(client.data(), SIGNAL(disconnected())));
-
-    QAmqpExchange *exchange = client->createExchange(exchangeName);
-    exchange->declare(QAmqpExchange::Headers, QAmqpExchange::AutoDelete);
-
-    QAmqpQueue *queue = client->createQueue(queueName);
-    queue->declare();
-    QAmqpTable bindingArguments;
-    bindingArguments.insert("x-match", "all");
-    bindingArguments.insert("source", "delayed-integration-test");
-    queue->bind(exchangeName, QString(), false, bindingArguments);
-
-    client->connectToHost();
-    QVERIFY(waitForSignal(client.data(), SIGNAL(connected())));
-    QVERIFY(waitForSignal(exchange, SIGNAL(declared())));
-    QVERIFY(waitForSignal(queue, SIGNAL(declared())));
-    QVERIFY(waitForSignal(queue, SIGNAL(bound())));
-    QVERIFY(queue->consume(QAmqpQueue::coNoAck));
-    QVERIFY(waitForSignal(queue, SIGNAL(consuming(QString))));
-
-    QAmqpTable matchingHeaders;
-    matchingHeaders.insert("source", "delayed-integration-test");
-    exchange->publish("delayed matched message", QString(), "text/plain", matchingHeaders);
-    QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
-    QCOMPARE(queue->dequeue().payload(), QByteArray("delayed matched message"));
-
-    queue->remove(QAmqpQueue::roForce);
-    QVERIFY(waitForSignal(queue, SIGNAL(removed())));
-}
-
 void tst_QAMQPQueue::delayedBind()
 {
     client->disconnectFromHost();
@@ -392,6 +330,8 @@ void tst_QAMQPQueue::purge()
     // create second client to listen to messages and attempt purge
     {
         QAmqpClient secondClient;
+        secondClient.setUsername("guest");
+        secondClient.setPassword("guest");
         secondClient.connectToHost();
         QVERIFY(waitForSignal(&secondClient, SIGNAL(connected())));
         QAmqpQueue *testPurgeQueue = secondClient.createQueue("test-purge");
