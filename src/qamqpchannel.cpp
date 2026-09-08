@@ -31,9 +31,9 @@ void QAmqpChannelPrivate::init(int channel, QAmqpClient *c)
 {
     client = c;
     QAmqpClientPrivate *clientPriv = client->d_func();
-    needOpen = (channel <= clientPriv->nextChannelNumber && channel != -1) ? false : true;
-    channelNumber = channel == -1 ? ++clientPriv->nextChannelNumber : channel;
-    clientPriv->nextChannelNumber = qMax(channelNumber, clientPriv->nextChannelNumber);
+    const quint16 previousChannelNumber = clientPriv->nextChannelNumber;
+    channelNumber = clientPriv->allocateChannelNumber(channel);
+    needOpen = channelNumber && (channel == -1 || channel > previousChannelNumber);
 }
 
 bool QAmqpChannelPrivate::_q_method(const QAmqpMethodFrame &frame)

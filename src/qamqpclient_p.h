@@ -43,6 +43,8 @@ public:
     void setPassword(const QString &password);
     bool parseConnectionString(const QString &uri);
     void sendFrame(const QAmqpFrame &frame);
+    quint16 allocateChannelNumber(int requestedChannelNumber);
+    static quint16 negotiateChannelMax(quint16 clientChannelMax, quint16 serverChannelMax);
 
     void closeConnection();
 
@@ -103,7 +105,8 @@ public:
     QPointer<QTimer> heartbeatTimer;
     QPointer<QTimer> reconnectTimer;
     QAmqpTable customProperties;
-    qint16 channelMax;
+    quint16 channelMax;
+    quint16 nextChannelNumber;
     qint16 heartbeatDelay;
     qint32 frameMax;
 
