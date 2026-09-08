@@ -41,8 +41,12 @@ public:
     void resetChannelState();
     void setUsername(const QString &username);
     void setPassword(const QString &password);
-    void parseConnectionString(const QString &uri);
+    bool parseConnectionString(const QString &uri);
     void sendFrame(const QAmqpFrame &frame);
+    quint16 allocateChannelNumber(int requestedChannelNumber);
+    static quint16 negotiateChannelMax(quint16 clientChannelMax, quint16 serverChannelMax);
+    static qint32 negotiateFrameMax(qint32 clientFrameMax, qint32 serverFrameMax);
+    static qint16 negotiateHeartbeat(qint16 clientHeartbeat, qint16 serverHeartbeat);
 
     void closeConnection();
 
@@ -93,17 +97,14 @@ public:
     QHash<quint16, QList<QAmqpContentFrameHandler*> > contentHandlerByChannel;
     QHash<quint16, QList<QAmqpContentBodyFrameHandler*> > bodyHandlersByChannel;
 
-    // channel numbers are scoped per-connection; keeping this per-client avoids
-    // cross-connection interference and the data race of a process-wide counter
-    quint16 nextChannelNumber;
-
     // Connection
     bool closed;
     bool connected;
     QPointer<QTimer> heartbeatTimer;
     QPointer<QTimer> reconnectTimer;
     QAmqpTable customProperties;
-    qint16 channelMax;
+    quint16 channelMax;
+    quint16 nextChannelNumber;
     qint16 heartbeatDelay;
     qint32 frameMax;
 
