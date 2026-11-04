@@ -51,7 +51,9 @@ public:
     Q_DECLARE_FLAGS(PublishOptions, PublishOption)
 
     enum PublishError {
-        InvalidShortString
+        InvalidShortString,
+        FrameSizeLimitExceeded,
+        EncodingFailed
     };
     Q_ENUM(PublishError)
 
@@ -95,6 +97,7 @@ Q_SIGNALS:
     void confirmsEnabled();
     void allMessagesDelivered();
     void publishRejected(QAmqpExchange::PublishError error);
+    void publishFailed(QAmqpExchange::PublishError error);
     void pendingPublishesCancelled(int count, qlonglong reservedBytes);
 
 public Q_SLOTS:

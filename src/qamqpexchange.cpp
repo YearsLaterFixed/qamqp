@@ -3,6 +3,8 @@
 #include <QTimer>
 #include <QDebug>
 #include <QBuffer>
+#include <QtEndian>
+#include <limits>
 
 #include "qamqpexchange.h"
 #include "qamqpexchange_p.h"
@@ -41,7 +43,7 @@ qint64 QAmqpExchangePrivate::clearPendingPublishes()
     qint64 reservedBytes = 0;
     foreach (const PendingPublish &publish, pendingPublishes) {
         if (publish.hasWriteReservation)
-            reservedBytes += publish.encoded.size();
+            reservedBytes += publish.reservedBytes;
     }
     pendingPublishes.clear();
     pendingPublishBytes = 0;
@@ -75,10 +77,21 @@ void QAmqpExchangePrivate::flushPendingPublishes()
 
     while (!pendingPublishes.isEmpty()) {
         const PendingPublish &publish = pendingPublishes.head();
-        if (sendPublish(publish) != QAmqpExchange::AcceptedForWrite)
+        QAmqpExchange::PublishError failure = QAmqpExchange::EncodingFailed;
+        const QAmqpExchange::PublishResult result = sendPublish(publish, &failure);
+        if (result != QAmqpExchange::AcceptedForWrite && result != QAmqpExchange::RejectedInvalid)
             return;
-        pendingPublishBytes -= publish.encoded.size();
+        const qint64 reservedBytes = publish.reservedBytes;
+        pendingPublishBytes -= reservedBytes;
         pendingPublishes.dequeue();
+        if (result == QAmqpExchange::RejectedInvalid) {
+            releaseWriteBytes(reservedBytes);
+            Q_Q(QAmqpExchange);
+            QPointer<QAmqpExchange> guard(q);
+            Q_EMIT q->publishFailed(failure);
+            if (!guard)
+                return;
+        }
     }
 }
 
@@ -383,9 +396,8 @@ QAmqpExchange::PublishResult QAmqpExchange::publish(
     publish.headers = headers;
     publish.properties = properties;
     publish.publishOptions = publishOptions;
-    publish.encoded = d->serializePublish(publish);
+    publish.encoded = d->serializePublishHeader(publish);
     publish.hasWriteReservation = false;
-    publish.message.clear();
     publish.routingKey.clear();
     publish.mimeType.clear();
     publish.headers.clear();
@@ -393,25 +405,66 @@ QAmqpExchange::PublishResult QAmqpExchange::publish(
     if (publish.encoded.isEmpty())
         return RejectedLimit;
 
-    if (QAmqpExchangePrivate::shouldDeferPublish(d->opened, d->flowActive)) {
-        // Bound the complete serialized publish, including protocol metadata.
-        if (d->pendingPublishes.size() >= 1000 ||
-            d->pendingPublishBytes + publish.encoded.size() > 16 * 1024 * 1024 ||
-            !d->reserveWriteBytes(publish.encoded.size())) {
-            qAmqpDebug() << Q_FUNC_INFO << "pending publish limit reached";
-            return RejectedLimit;
-        }
+    const bool deferred = QAmqpExchangePrivate::shouldDeferPublish(d->opened, d->flowActive);
+    const qint32 frameLimit = deferred ? AMQP_FRAME_MIN_SIZE : d->client->frameMax();
+    if (!QAmqpExchangePrivate::headerFitsFrameLimit(publish.encoded, frameLimit)) {
+        Q_EMIT publishRejected(FrameSizeLimitExceeded);
+        return RejectedLimit;
+    }
+    publish.reservedBytes = QAmqpExchangePrivate::publishReservation(
+        publish.encoded.size(), publish.message.size(), frameLimit);
+    if (publish.reservedBytes > std::numeric_limits<int>::max())
+        return RejectedLimit;
+    if ((deferred && (d->pendingPublishes.size() >= 1000 ||
+                     publish.reservedBytes > 16 * 1024 * 1024 - d->pendingPublishBytes)) ||
+        !d->reserveWriteBytes(publish.reservedBytes))
+        return RejectedLimit;
 
-        publish.hasWriteReservation = true;
+    publish.hasWriteReservation = true;
+    if (deferred) {
         d->pendingPublishes.enqueue(publish);
-        d->pendingPublishBytes += publish.encoded.size();
+        d->pendingPublishBytes += publish.reservedBytes;
         return Queued;
     }
 
-    return d->sendPublish(publish);
+    PublishError failure = EncodingFailed;
+    const PublishResult result = d->sendPublish(publish, &failure);
+    if (result != AcceptedForWrite) {
+        d->releaseWriteBytes(publish.reservedBytes);
+        if (result == RejectedInvalid)
+            Q_EMIT publishRejected(failure);
+    }
+    return result;
 }
 
-QByteArray QAmqpExchangePrivate::serializePublish(const PendingPublish &publish) const
+bool QAmqpExchangePrivate::headerFitsFrameLimit(const QByteArray &header, qint32 frameLimit)
+{
+    const qint64 maximum = frameLimit ? qMin(frameLimit, AMQP_FRAME_MAX) : AMQP_FRAME_MAX;
+    qint64 offset = 0;
+    while (offset < header.size()) {
+        if (header.size() - offset < QAmqpFrame::HEADER_SIZE)
+            return false;
+        const uchar *bytes = reinterpret_cast<const uchar *>(header.constData() + offset);
+        const qint64 size = QAmqpFrame::HEADER_SIZE + qFromBigEndian<quint32>(bytes + 3) +
+            QAmqpFrame::FRAME_END_SIZE;
+        if (size > maximum || size > header.size() - offset)
+            return false;
+        offset += size;
+    }
+    return maximum >= AMQP_FRAME_MIN_SIZE;
+}
+
+qint64 QAmqpExchangePrivate::publishReservation(qint64 headerBytes, qint64 bodyBytes,
+                                              qint32 frameLimit)
+{
+    const qint64 maximum = frameLimit ? qMin(frameLimit, AMQP_FRAME_MAX) : AMQP_FRAME_MAX;
+    const qint64 bodyCapacity = maximum - QAmqpFrame::HEADER_SIZE - QAmqpFrame::FRAME_END_SIZE;
+    const qint64 frames = bodyBytes ? (bodyBytes + bodyCapacity - 1) / bodyCapacity : 0;
+    return 2 * (headerBytes + bodyBytes + frames *
+                (QAmqpFrame::HEADER_SIZE + QAmqpFrame::FRAME_END_SIZE));
+}
+
+QByteArray QAmqpExchangePrivate::serializePublishHeader(const PendingPublish &publish) const
 {
     QByteArray data;
     QBuffer buffer(&data);
@@ -451,16 +504,23 @@ QByteArray QAmqpExchangePrivate::serializePublish(const PendingPublish &publish)
     content.setBodySize(publish.message.size());
     stream << content;
 
-    int fullSize = publish.message.size();
-    // frame-max bounds the entire frame, so a body chunk must leave room for the
-    // header and the frame-end octet; zero means the broker imposed no limit
+    return stream.status() == QDataStream::Ok ? data : QByteArray();
+}
+
+QByteArray QAmqpExchangePrivate::serializePublish(const PendingPublish &publish, qint32 frameLimit) const
+{
+    QByteArray data;
+    data.reserve(int(publish.reservedBytes / 2));
+    QDataStream stream(&data, QIODevice::WriteOnly);
+    stream.writeRawData(publish.encoded.constData(), publish.encoded.size());
+    const int fullSize = publish.message.size();
     const int frameOverhead = int(QAmqpFrame::HEADER_SIZE + QAmqpFrame::FRAME_END_SIZE);
-    const int chunkSize = client->frameMax() > frameOverhead
-                              ? client->frameMax() - frameOverhead
-                              : fullSize;
+    const int maximum = frameLimit ? qMin(frameLimit, AMQP_FRAME_MAX) : AMQP_FRAME_MAX;
+    const int chunkSize = maximum - frameOverhead;
     for (int sent = 0; sent < fullSize; sent += chunkSize) {
         QAmqpContentBodyFrame body;
-        QByteArray partition = publish.message.mid(sent, chunkSize);
+        QByteArray partition = QByteArray::fromRawData(publish.message.constData() + sent,
+                                  qMin(chunkSize, fullSize - sent));
         body.setChannel(channelNumber);
         body.setBody(partition);
         stream << body;
@@ -469,13 +529,24 @@ QByteArray QAmqpExchangePrivate::serializePublish(const PendingPublish &publish)
     return stream.status() == QDataStream::Ok ? data : QByteArray();
 }
 
-QAmqpExchange::PublishResult QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
+QAmqpExchange::PublishResult QAmqpExchangePrivate::sendPublish(
+    const PendingPublish &publish, QAmqpExchange::PublishError *failure)
 {
     if (!client || !client->isConnected() ||
         client->socketState() != QAbstractSocket::ConnectedState)
         return QAmqpExchange::NotConnected;
-    if (!sendFrameBatch(publish.encoded,
-                        publish.hasWriteReservation ? publish.encoded.size() : 0))
+    if (!headerFitsFrameLimit(publish.encoded, client->frameMax())) {
+        if (failure)
+            *failure = QAmqpExchange::FrameSizeLimitExceeded;
+        return QAmqpExchange::RejectedInvalid;
+    }
+    const QByteArray encoded = serializePublish(publish, client->frameMax());
+    if (encoded.isEmpty() || encoded.size() > publish.reservedBytes / 2) {
+        if (failure)
+            *failure = QAmqpExchange::EncodingFailed;
+        return QAmqpExchange::RejectedInvalid;
+    }
+    if (!sendFrameBatch(encoded, publish.hasWriteReservation ? publish.reservedBytes : 0))
         return QAmqpExchange::RejectedLimit;
 
     if (nextDeliveryTag > 0) {

@@ -18,6 +18,7 @@ public:
         QAmqpMessage::PropertyHash properties;
         int publishOptions;
         QByteArray encoded;
+        qint64 reservedBytes;
         bool hasWriteReservation;
     };
 
@@ -39,8 +40,12 @@ public:
     virtual void flowStateChanged(bool active);
 
     void declare();
-    QAmqpExchange::PublishResult sendPublish(const PendingPublish &publish);
-    QByteArray serializePublish(const PendingPublish &publish) const;
+    QAmqpExchange::PublishResult sendPublish(const PendingPublish &publish,
+                                           QAmqpExchange::PublishError *failure = 0);
+    QByteArray serializePublishHeader(const PendingPublish &publish) const;
+    QByteArray serializePublish(const PendingPublish &publish, qint32 frameLimit) const;
+    static bool headerFitsFrameLimit(const QByteArray &header, qint32 frameLimit);
+    static qint64 publishReservation(qint64 headerBytes, qint64 bodyBytes, qint32 frameLimit);
     void flushPendingPublishes();
     qint64 clearPendingPublishes();
 

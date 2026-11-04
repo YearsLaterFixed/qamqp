@@ -49,6 +49,12 @@ private Q_SLOTS:
     void deletingExchangeReleasesOnlyItsReservations();
     void cancellingDeferredPublishesIsScoped();
     void cancellingDeferredPublishesPreservesWriterBacklog();
+    void queuedPublishUsesNegotiatedFrameSize();
+    void conservativePublishReservations();
+    void publishMetadataFrameLimits();
+    void incomingFrameLimitIncludesOverhead();
+    void deferredFramingFailureIsObservable();
+    void immediateWriterFailureDoesNotRetainReservation();
     void clientDestructionWithDeferredPublishes();
     void writeQueueReservation();
     void asynchronousWriteQueue();
@@ -318,6 +324,8 @@ public:
 protected:
     qint64 writeData(const char *data, qint64 bytes) override
     {
+        if (maximumWriteSize < 0)
+            return -1;
         return maximumWriteSize ? QSslSocket::writeData(data, qMin(bytes, maximumWriteSize)) : 0;
     }
 };
@@ -412,6 +420,263 @@ void tst_QAMQPFlow::cancellingDeferredPublishesPreservesWriterBacklog()
     QTRY_COMPARE(client.bufferedWriteBytes(), retainedBytes);
     delete retained;
     QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
+}
+
+void tst_QAMQPFlow::queuedPublishUsesNegotiatedFrameSize()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QAmqpExchange *exchange = client.createExchange("reframed-publish");
+    QAmqpExchangePrivate *exchangeState = dynamic_cast<QAmqpExchangePrivate *>(
+        writer.methodHandlersByChannel.value(exchange->channelNumber()).first());
+    QVERIFY(exchangeState);
+    QSignalSpy failures(exchange, &QAmqpExchange::publishFailed);
+    QSignalSpy rejected(exchange, &QAmqpExchange::publishRejected);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        writer.frameMax = 65536;
+        const QByteArray firstPayload(20000, char('a' + attempt));
+        const QByteArray secondPayload(7000, char('x' + attempt));
+        QCOMPARE(exchange->publish(firstPayload, "route", "application/octet-stream"), QAmqpExchange::Queued);
+        QCOMPARE(exchange->publish(secondPayload, "route", "application/octet-stream"), QAmqpExchange::Queued);
+        const qlonglong reservedBytes = client.bufferedWriteBytes();
+        client.setMaxWriteQueueBytes(reservedBytes);
+        QTcpSocket *peer = connectControlWriter(client, server);
+        QVERIFY(peer);
+        if (attempt == 1) {
+            peer->abort();
+            QTRY_COMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+            QCOMPARE(client.bufferedWriteBytes(), reservedBytes);
+            QCOMPARE(exchangeState->pendingPublishes.size(), 2);
+            peer = connectControlWriter(client, server);
+            QVERIFY(peer);
+        }
+        writer.connected = true;
+        writer.frameMax = attempt == 2 ? 8192 : 4096;
+        const qint64 expectedBytes =
+            exchangeState->serializePublish(exchangeState->pendingPublishes.at(0), writer.frameMax).size() +
+            exchangeState->serializePublish(exchangeState->pendingPublishes.at(1), writer.frameMax).size();
+        exchangeState->opened = true;
+        exchangeState->flushPendingPublishes();
+        QCOMPARE(exchangeState->pendingPublishBytes, qint64(0));
+        QVERIFY(exchangeState->pendingPublishes.isEmpty());
+        QTRY_COMPARE(peer->bytesAvailable(), expectedBytes);
+        QTRY_COMPARE(writer.bufferedWriteBytes, qint64(0));
+        QDataStream input(peer->readAll());
+        QByteArray received;
+        int methods = 0;
+        int headers = 0;
+        while (!input.atEnd()) {
+            quint8 type = 0;
+            quint16 channel = 0;
+            quint32 payloadSize = 0;
+            input >> type >> channel >> payloadSize;
+            QVERIFY(payloadSize + 8 <= quint32(writer.frameMax));
+            QCOMPARE(channel, quint16(exchange->channelNumber()));
+            QByteArray framePayload(int(payloadSize), char(0));
+            QCOMPARE(input.readRawData(framePayload.data(), framePayload.size()), framePayload.size());
+            quint8 end = 0;
+            input >> end;
+            QCOMPARE(end, quint8(QAmqpFrame::FRAME_END));
+            if (type == QAmqpFrame::Body)
+                received += framePayload;
+            else if (type == QAmqpFrame::Method)
+                ++methods;
+            else if (type == QAmqpFrame::Header)
+                ++headers;
+        }
+        QCOMPARE(methods, 2);
+        QCOMPARE(headers, 2);
+        QCOMPARE(received, firstPayload + secondPayload);
+        peer->abort();
+        QTRY_COMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+    }
+    QCOMPARE(failures.count(), 0);
+    QCOMPARE(rejected.count(), 0);
+}
+
+void tst_QAMQPFlow::conservativePublishReservations()
+{
+    QCOMPARE(QAmqpExchangePrivate::publishReservation(100, 0, 4096), qint64(200));
+    QCOMPARE(QAmqpExchangePrivate::publishReservation(100, 4088, 4096), qint64(2 * (100 + 4088 + 8)));
+    QCOMPARE(QAmqpExchangePrivate::publishReservation(100, 4089, 4096), qint64(2 * (100 + 4089 + 16)));
+    QAmqpClient client;
+    QAmqpExchange *exchange = client.createExchange("reservation-boundary");
+    QCOMPARE(exchange->publish(QByteArray(4089, 'p'), "route", "text/plain"), QAmqpExchange::Queued);
+    const qlonglong required = client.bufferedWriteBytes();
+    QCOMPARE(exchange->cancelPendingPublishes(), 1);
+    client.setMaxWriteQueueBytes(required - 1);
+    QCOMPARE(exchange->publish(QByteArray(4089, 'p'), "route", "text/plain"), QAmqpExchange::RejectedLimit);
+    QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
+    client.setMaxWriteQueueBytes(required);
+    QCOMPARE(exchange->publish(QByteArray(4089, 'p'), "route", "text/plain"), QAmqpExchange::Queued);
+    QCOMPARE(client.bufferedWriteBytes(), required);
+}
+
+void tst_QAMQPFlow::publishMetadataFrameLimits()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QAmqpMethodFrame method(QAmqpFrame::Basic, 40);
+    method.setChannel(1);
+    method.setArguments(QByteArray(4084, 'm'));
+    QCOMPARE(encodeFrame(method).size(), 4096);
+    QVERIFY(QAmqpExchangePrivate::headerFitsFrameLimit(encodeFrame(method), 4096));
+    method.setArguments(QByteArray(4085, 'm'));
+    QVERIFY(!QAmqpExchangePrivate::headerFitsFrameLimit(encodeFrame(method), 4096));
+
+    QAmqpTable headers;
+    headers.insert("large", QByteArray());
+    QAmqpContentFrame content(QAmqpFrame::Basic);
+    content.setChannel(1);
+    content.setBodySize(0);
+    content.setProperty(QAmqpMessage::Headers, headers);
+    const int baseBytes = encodeFrame(content).size();
+    headers.insert("large", QByteArray(4096 - baseBytes, 'h'));
+    content.setProperty(QAmqpMessage::Headers, headers);
+    QCOMPARE(encodeFrame(content).size(), 4096);
+    QVERIFY(QAmqpExchangePrivate::headerFitsFrameLimit(encodeFrame(content), 4096));
+    headers.insert("large", QByteArray(4097 - baseBytes, 'h'));
+    content.setProperty(QAmqpMessage::Headers, headers);
+    QVERIFY(!QAmqpExchangePrivate::headerFitsFrameLimit(encodeFrame(content), 4096));
+
+    ControlTestClient client;
+    QAmqpExchange *exchange = client.createExchange("metadata-limit");
+    QSignalSpy rejected(exchange, &QAmqpExchange::publishRejected);
+    QCOMPARE(exchange->publish(QByteArray("payload"), "route", "text/plain", headers),
+             QAmqpExchange::RejectedLimit);
+    QCOMPARE(rejected.count(), 1);
+    QCOMPARE(rejected.first().at(0).value<QAmqpExchange::PublishError>(),
+             QAmqpExchange::FrameSizeLimitExceeded);
+    QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
+
+    QTcpServer server;
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    QAmqpClientPrivate &writer = *client.state();
+    writer.connected = true;
+    writer.frameMax = 8192;
+    QAmqpExchangePrivate *exchangeState = dynamic_cast<QAmqpExchangePrivate *>(
+        writer.methodHandlersByChannel.value(exchange->channelNumber()).first());
+    QVERIFY(exchangeState);
+    exchangeState->opened = true;
+    QCOMPARE(exchange->publish(QByteArray("payload"), "route", "text/plain", headers),
+             QAmqpExchange::AcceptedForWrite);
+    const qint64 expectedBytes = writer.socketPendingBytes;
+    QTRY_COMPARE(peer->bytesAvailable(), expectedBytes);
+    QVERIFY(QAmqpExchangePrivate::headerFitsFrameLimit(peer->readAll(), 8192));
+    QTRY_COMPARE(client.bufferedWriteBytes(), qlonglong(0));
+    QCOMPARE(rejected.count(), 1);
+    exchangeState->flowActive = false;
+    QCOMPARE(exchange->publish(QByteArray("payload"), "route", "text/plain", headers),
+             QAmqpExchange::RejectedLimit);
+    QCOMPARE(rejected.count(), 2);
+    QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
+}
+
+void tst_QAMQPFlow::incomingFrameLimitIncludesOverhead()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    writer.frameMax = 4096;
+    QByteArray header;
+    QDataStream headerStream(&header, QIODevice::WriteOnly);
+    headerStream << quint8(QAmqpFrame::Body) << quint16(1) << quint32(4089);
+    peer->write(header);
+    peer->flush();
+    QTRY_COMPARE(writer.socket->bytesAvailable(), qint64(header.size()));
+    writer._q_readyRead();
+    QTRY_VERIFY(peer->bytesAvailable() > 0);
+    QDataStream response(peer->readAll());
+    QAmqpMethodFrame close;
+    response >> close;
+    QCOMPARE(close.methodClass(), QAmqpFrame::Connection);
+    QCOMPARE(close.id(), qint16(QAmqpClientPrivate::miClose));
+    QDataStream arguments(close.arguments());
+    quint16 code = 0;
+    arguments >> code;
+    QCOMPARE(code, quint16(QAMQP::FrameError));
+    writer.socket->readAll();
+    writer.frameMax = 0;
+    QSignalSpy heartbeats(&client, &QAmqpClient::heartbeat);
+    QAmqpHeartbeatFrame heartbeat;
+    peer->write(encodeFrame(heartbeat));
+    peer->flush();
+    QTRY_COMPARE(writer.socket->bytesAvailable(), qint64(8));
+    writer._q_readyRead();
+    QCOMPARE(heartbeats.count(), 1);
+}
+
+void tst_QAMQPFlow::deferredFramingFailureIsObservable()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QAmqpExchange *exchange = client.createExchange("failed-framing");
+    QAmqpExchange *retained = client.createExchange("retained-framing");
+    QCOMPARE(retained->publish("retained", "route"), QAmqpExchange::Queued);
+    const qlonglong retainedBytes = client.bufferedWriteBytes();
+    QCOMPARE(exchange->publish("queued", "route"), QAmqpExchange::Queued);
+    QSignalSpy failures(exchange, &QAmqpExchange::publishFailed);
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    writer.connected = true;
+    writer.frameMax = 2048;
+    QAmqpExchangePrivate *exchangeState = dynamic_cast<QAmqpExchangePrivate *>(
+        writer.methodHandlersByChannel.value(exchange->channelNumber()).first());
+    QVERIFY(exchangeState);
+    exchangeState->opened = true;
+    exchangeState->flushPendingPublishes();
+    QCOMPARE(failures.count(), 1);
+    QCOMPARE(failures.first().at(0).value<QAmqpExchange::PublishError>(),
+             QAmqpExchange::FrameSizeLimitExceeded);
+    QVERIFY(exchangeState->pendingPublishes.isEmpty());
+    QCOMPARE(client.bufferedWriteBytes(), retainedBytes);
+    QCOMPARE(peer->bytesAvailable(), qint64(0));
+}
+
+void tst_QAMQPFlow::immediateWriterFailureDoesNotRetainReservation()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QAmqpExchange *exchange = client.createExchange("failed-writer");
+    QCOMPARE(exchange->publish("queued payload", "route"), QAmqpExchange::Queued);
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    static_cast<PartialWriteSocket *>(writer.socket)->maximumWriteSize = -1;
+    writer.connected = true;
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    QSignalSpy discarded(&client, &QAmqpClient::writeQueueDiscarded);
+    QAmqpExchangePrivate *exchangeState = dynamic_cast<QAmqpExchangePrivate *>(
+        writer.methodHandlersByChannel.value(exchange->channelNumber()).first());
+    QVERIFY(exchangeState);
+    exchangeState->opened = true;
+    exchangeState->flushPendingPublishes();
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(discarded.count(), 1);
+    QVERIFY(discarded.first().at(0).toLongLong() > 0);
+    QCOMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+    QVERIFY(exchangeState->pendingPublishes.isEmpty());
+    QCOMPARE(exchangeState->pendingPublishBytes, qint64(0));
+    QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
+    QCOMPARE(exchange->cancelPendingPublishes(), 0);
 }
 
 void tst_QAMQPFlow::controlFramesRespectPublishSequence()
