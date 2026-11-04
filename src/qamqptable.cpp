@@ -301,7 +301,7 @@ QVariant QAmqpTable::readFieldValue(QDataStream &stream, QAmqpMetaType::ValueTyp
 
     case QAmqpMetaType::ShortShortInt:
     {
-        char octet;
+        char octet = 0;
         stream.readRawData(&octet, sizeof(octet));
         return QVariant::fromValue<int>(octet);
     }
@@ -325,7 +325,7 @@ QVariant QAmqpTable::readFieldValue(QDataStream &stream, QAmqpMetaType::ValueTyp
     }
     case QAmqpMetaType::Float:
     {
-        float tmp_value;
+        float tmp_value = 0;
         QDataStream::FloatingPointPrecision precision = stream.floatingPointPrecision();
         stream.setFloatingPointPrecision(QDataStream::SinglePrecision);
         stream >> tmp_value;
@@ -334,7 +334,7 @@ QVariant QAmqpTable::readFieldValue(QDataStream &stream, QAmqpMetaType::ValueTyp
     }
     case QAmqpMetaType::Double:
     {
-        double tmp_value;
+        double tmp_value = 0;
         QDataStream::FloatingPointPrecision precision = stream.floatingPointPrecision();
         stream.setFloatingPointPrecision(QDataStream::DoublePrecision);
         stream >> tmp_value;
@@ -343,7 +343,7 @@ QVariant QAmqpTable::readFieldValue(QDataStream &stream, QAmqpMetaType::ValueTyp
     }
     case QAmqpMetaType::Decimal:
     {
-        QAMQP::Decimal v;
+        QAMQP::Decimal v = {0, 0};
         stream >> v.scale;
         stream >> v.value;
         return QVariant::fromValue<QAMQP::Decimal>(v);
@@ -387,6 +387,7 @@ QVariant QAmqpTable::readFieldValue(QDataStream &stream, QAmqpMetaType::ValueTyp
         break;
     default:
         qAmqpDebug() << Q_FUNC_INFO << "unhandled type: " << type;
+        stream.setStatus(QDataStream::ReadCorruptData);
     }
 
     return QVariant();

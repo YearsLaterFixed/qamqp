@@ -1,5 +1,8 @@
 #include <QtTest/QtTest>
 #include <QRandomGenerator>
+#include <QSslSocket>
+#include <QTcpServer>
+#include <QTcpSocket>
 
 #include "qamqpframe_p.h"
 #include "qamqpclient_p.h"
@@ -33,6 +36,12 @@ private Q_SLOTS:
 
     void truncatedMethodFrame();
     void decodedFrameValidation();
+    void truncatedTuneDoesNotMutateNegotiation();
+    void incomingMethodSchemas_data();
+    void incomingMethodSchemas();
+    void invalidMethodValues_data();
+    void invalidMethodValues();
+    void unsignedTuneValuesRemainValid();
     void deeplyNestedArray();
 
     void messageBodySize_data();
@@ -282,7 +291,7 @@ void tst_QAMQPParser::truncatedMethodFrame()
 void tst_QAMQPParser::decodedFrameValidation()
 {
     QByteArray validMethodBytes;
-    QAmqpMethodFrame validMethod(QAmqpFrame::Basic, 10);
+    QAmqpMethodFrame validMethod(QAmqpFrame::Basic, QAmqpChannelPrivate::bmQosOk);
     validMethod.setChannel(1);
     QDataStream validMethodOut(&validMethodBytes, QIODevice::WriteOnly);
     validMethodOut << validMethod;
@@ -356,6 +365,339 @@ void tst_QAMQPParser::decodedFrameValidation()
     QCOMPARE(trailingContentIn.status(), QDataStream::ReadCorruptData);
     QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(trailingContent,
                                                       trailingContentIn.status(), 15));
+}
+
+void tst_QAMQPParser::truncatedTuneDoesNotMutateNegotiation()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    QAmqpClient client;
+    QAmqpClientPrivate receiver(&client);
+    receiver.socket = new QSslSocket(&client);
+    receiver.channelMax = 16;
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    receiver.socket->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(receiver.socket->waitForConnected(1000));
+    QVERIFY(server.hasPendingConnections() || server.waitForNewConnection(1000));
+    QTcpSocket *peer = server.nextPendingConnection();
+    QVERIFY(peer);
+    QAmqpMethodFrame tune(QAmqpFrame::Connection, QAmqpClientPrivate::miTune);
+    QByteArray arguments;
+    QDataStream argumentStream(&arguments, QIODevice::WriteOnly);
+    argumentStream << quint16(5);
+    tune.setArguments(arguments);
+    QByteArray wire;
+    QDataStream wireStream(&wire, QIODevice::WriteOnly);
+    wireStream << tune;
+    peer->write(wire);
+    peer->flush();
+    QVERIFY(receiver.socket->waitForReadyRead(1000));
+    receiver._q_readyRead();
+    QCOMPARE(receiver.channelMax, quint16(16));
+    QTRY_VERIFY(peer->bytesAvailable() > 0);
+    QDataStream response(peer->readAll());
+    QAmqpMethodFrame close;
+    response >> close;
+    QCOMPARE(close.methodClass(), QAmqpFrame::Connection);
+    QCOMPARE(close.id(), qint16(QAmqpClientPrivate::miClose));
+    QDataStream closeArguments(close.arguments());
+    quint16 code = 0;
+    closeArguments >> code;
+    QCOMPARE(code, quint16(QAMQP::FrameError));
+    QVERIFY(receiver.closed);
+    QAmqpMethodFrame openOk(QAmqpFrame::Connection, QAmqpClientPrivate::miOpenOk);
+    openOk.setArguments(QByteArray(1, char(0)));
+    QByteArray laterWire;
+    QDataStream laterOutput(&laterWire, QIODevice::WriteOnly);
+    laterOutput << openOk;
+    peer->write(laterWire);
+    peer->flush();
+    QVERIFY(receiver.socket->waitForReadyRead(1000));
+    receiver._q_readyRead();
+    QCOMPARE(connected.count(), 0);
+    QVERIFY(!receiver.connected);
+}
+
+class MethodDispatchProbe : public QAmqpMethodFrameHandler
+{
+public:
+    MethodDispatchProbe() : calls(0) {}
+    bool _q_method(const QAmqpMethodFrame &) override { ++calls; return true; }
+    int calls;
+};
+
+static QByteArray encodedString(const QString &text, QAmqpMetaType::ValueType type)
+{
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    QAmqpFrame::writeAmqpField(stream, type, text);
+    return bytes;
+}
+
+void tst_QAMQPParser::incomingMethodSchemas_data()
+{
+    QTest::addColumn<int>("methodClass");
+    QTest::addColumn<int>("methodId");
+    QTest::addColumn<QByteArray>("arguments");
+    const QByteArray shortEmpty = encodedString(QString(), QAmqpMetaType::ShortString);
+    const QByteArray longEmpty = encodedString(QString(), QAmqpMetaType::LongString);
+    const QByteArray consumer = encodedString("consumer", QAmqpMetaType::ShortString);
+    QByteArray close;
+    QDataStream closeStream(&close, QIODevice::WriteOnly);
+    closeStream << quint16(200);
+    QAmqpFrame::writeAmqpField(closeStream, QAmqpMetaType::ShortString, "closed");
+    closeStream << quint16(0) << quint16(0);
+    QByteArray start;
+    QDataStream startStream(&start, QIODevice::WriteOnly);
+    startStream << quint8(0) << quint8(9) << QAmqpTable();
+    QAmqpFrame::writeAmqpField(startStream, QAmqpMetaType::LongString, "PLAIN");
+    QAmqpFrame::writeAmqpField(startStream, QAmqpMetaType::LongString, "en_US");
+    QByteArray tune;
+    QDataStream tuneStream(&tune, QIODevice::WriteOnly);
+    tuneStream << quint16(16) << quint32(4096) << quint16(30);
+    QByteArray count;
+    QDataStream countStream(&count, QIODevice::WriteOnly);
+    countStream << quint32(1);
+    QByteArray deliveryTag;
+    QDataStream tagStream(&deliveryTag, QIODevice::WriteOnly);
+    tagStream << qulonglong(1);
+    const QByteArray delivery = deliveryTag + QByteArray(1, char(0)) + shortEmpty + shortEmpty;
+    QByteArray returned;
+    QDataStream returnStream(&returned, QIODevice::WriteOnly);
+    returnStream << quint16(312);
+    returned += shortEmpty + shortEmpty + shortEmpty;
+    const auto add = [](const char *name, int methodClass, int methodId, const QByteArray &arguments) {
+        QTest::newRow(name) << methodClass << methodId << arguments;
+    };
+    add("connection-start", QAmqpFrame::Connection, 10, start);
+    add("connection-secure", QAmqpFrame::Connection, 20, longEmpty);
+    add("connection-tune", QAmqpFrame::Connection, 30, tune);
+    QByteArray unlimitedTune;
+    QDataStream unlimitedStream(&unlimitedTune, QIODevice::WriteOnly);
+    unlimitedStream << quint16(0) << quint32(0) << quint16(0);
+    add("connection-tune-unlimited", QAmqpFrame::Connection, 30, unlimitedTune);
+    QByteArray maximumTune;
+    QDataStream maximumStream(&maximumTune, QIODevice::WriteOnly);
+    maximumStream << quint16(65535) << quint32(0xffffffffu) << quint16(65535);
+    add("connection-tune-unsigned-maximum", QAmqpFrame::Connection, 30, maximumTune);
+    add("connection-open-ok", QAmqpFrame::Connection, 41, shortEmpty);
+    add("connection-close", QAmqpFrame::Connection, 50, close);
+    add("connection-close-ok", QAmqpFrame::Connection, 51, QByteArray());
+    add("channel-open-ok", QAmqpFrame::Channel, 11, longEmpty);
+    add("channel-flow", QAmqpFrame::Channel, 20, QByteArray(1, char(1)));
+    add("channel-flow-ok", QAmqpFrame::Channel, 21, QByteArray(1, char(0)));
+    add("channel-close", QAmqpFrame::Channel, 40, close);
+    add("channel-close-ok", QAmqpFrame::Channel, 41, QByteArray());
+    add("exchange-declare-ok", QAmqpFrame::Exchange, 11, QByteArray());
+    add("exchange-delete-ok", QAmqpFrame::Exchange, 21, QByteArray());
+    add("queue-declare-ok", QAmqpFrame::Queue, 11, consumer + count + count);
+    add("queue-bind-ok", QAmqpFrame::Queue, 21, QByteArray());
+    add("queue-purge-ok", QAmqpFrame::Queue, 31, count);
+    add("queue-delete-ok", QAmqpFrame::Queue, 41, count);
+    add("queue-unbind-ok", QAmqpFrame::Queue, 51, QByteArray());
+    add("basic-qos-ok", QAmqpFrame::Basic, 11, QByteArray());
+    add("basic-consume-ok", QAmqpFrame::Basic, 21, consumer);
+    add("basic-cancel-ok", QAmqpFrame::Basic, 31, consumer);
+    add("basic-return", QAmqpFrame::Basic, 50, returned);
+    add("basic-deliver", QAmqpFrame::Basic, 60, consumer + delivery);
+    add("basic-get-ok", QAmqpFrame::Basic, 71, delivery + count);
+    add("basic-get-empty", QAmqpFrame::Basic, 72, shortEmpty);
+    add("basic-ack", QAmqpFrame::Basic, 80, deliveryTag + QByteArray(1, char(1)));
+    add("basic-nack", QAmqpFrame::Basic, 120, deliveryTag + QByteArray(1, char(3)));
+    add("basic-recover-ok", QAmqpFrame::Basic, 111, QByteArray());
+    add("confirm-select-ok", QAmqpFrame::Confirm, 11, QByteArray());
+    add("tx-select-ok", QAmqpFrame::Tx, 11, QByteArray());
+    add("tx-commit-ok", QAmqpFrame::Tx, 21, QByteArray());
+    add("tx-rollback-ok", QAmqpFrame::Tx, 31, QByteArray());
+}
+
+void tst_QAMQPParser::incomingMethodSchemas()
+{
+    QFETCH(int, methodClass);
+    QFETCH(int, methodId);
+    QFETCH(QByteArray, arguments);
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QAmqpMethodFrame method(static_cast<QAmqpFrame::MethodClass>(methodClass), qint16(methodId));
+    method.setChannel(methodClass == QAmqpFrame::Connection ? 0 : 1);
+    method.setArguments(arguments);
+    QVERIFY(QAmqpClientPrivate::validateDecodedFrame(method, QDataStream::Ok, arguments.size() + 4));
+
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    QAmqpClient client;
+    QAmqpClientPrivate receiver(&client);
+    receiver.socket = new QSslSocket(&client);
+    receiver.channelMax = 16;
+    receiver.heartbeatDelay = 30;
+    const qint32 originalFrameMax = receiver.frameMax;
+    MethodDispatchProbe probe;
+    receiver.methodHandlersByChannel[1].append(&probe);
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy disconnected(&client, &QAmqpClient::disconnected);
+    receiver.socket->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(receiver.socket->waitForConnected(1000));
+    QVERIFY(server.hasPendingConnections() || server.waitForNewConnection(1000));
+    QTcpSocket *peer = server.nextPendingConnection();
+    QVERIFY(peer);
+    for (int length = 0; length <= arguments.size(); ++length) {
+        receiver.closed = false;
+        method.setArguments(length == arguments.size() ? arguments + QByteArray(1, 'x') : arguments.left(length));
+        QByteArray wire;
+        QDataStream output(&wire, QIODevice::WriteOnly);
+        output << method;
+        peer->write(wire);
+        peer->flush();
+        QVERIFY(receiver.socket->waitForReadyRead(1000));
+        receiver._q_readyRead();
+        QCOMPARE(probe.calls, 0);
+        QCOMPARE(connected.count(), 0);
+        QCOMPARE(disconnected.count(), 0);
+        QCOMPARE(receiver.channelMax, quint16(16));
+        QCOMPARE(receiver.heartbeatDelay, quint16(30));
+        QCOMPARE(receiver.frameMax, originalFrameMax);
+        QVERIFY(!receiver.connected);
+        QTRY_VERIFY(peer->bytesAvailable() > 0);
+        QDataStream response(peer->readAll());
+        QAmqpMethodFrame close;
+        response >> close;
+        QCOMPARE(close.methodClass(), QAmqpFrame::Connection);
+        QCOMPARE(close.id(), qint16(QAmqpClientPrivate::miClose));
+        QDataStream closeArguments(close.arguments());
+        quint16 code = 0;
+        closeArguments >> code;
+        QCOMPARE(code, quint16(QAMQP::FrameError));
+    }
+}
+
+void tst_QAMQPParser::invalidMethodValues_data()
+{
+    QTest::addColumn<int>("methodClass");
+    QTest::addColumn<int>("methodId");
+    QTest::addColumn<QByteArray>("arguments");
+    const auto add = [](const char *name, int methodClass, int methodId, const QByteArray &arguments) {
+        QTest::newRow(name) << methodClass << methodId << arguments;
+    };
+    QByteArray tune;
+    QDataStream tuneStream(&tune, QIODevice::WriteOnly);
+    tuneStream << quint16(16) << quint32(4095) << quint16(30);
+    add("tune-below-minimum", QAmqpFrame::Connection, 30, tune);
+    add("flow-invalid-bits", QAmqpFrame::Channel, 20, QByteArray(1, char(2)));
+    add("flow-ok-invalid-bits", QAmqpFrame::Channel, 21, QByteArray(1, char(0x80)));
+    add("empty-consumer", QAmqpFrame::Basic, 21, QByteArray(1, char(0)));
+    add("empty-cancel-tag", QAmqpFrame::Basic, 31, QByteArray(1, char(0)));
+    add("short-string-overrun", QAmqpFrame::Basic, 21, QByteArray::fromHex("0561"));
+    add("long-string-overrun", QAmqpFrame::Connection, 20, QByteArray::fromHex("0000000561"));
+    add("ack-zero-single-tag", QAmqpFrame::Basic, 80, QByteArray(9, char(0)));
+    add("ack-invalid-bits", QAmqpFrame::Basic, 80, QByteArray::fromHex("000000000000000102"));
+    add("nack-invalid-bits", QAmqpFrame::Basic, 120, QByteArray::fromHex("000000000000000104"));
+    QByteArray start;
+    QDataStream startStream(&start, QIODevice::WriteOnly);
+    startStream << quint8(0) << quint8(9) << quint32(5) << quint8(1) << qint8('k') << qint8('?');
+    add("malformed-start-table", QAmqpFrame::Connection, 10, start);
+    QByteArray unknownField;
+    QDataStream unknownStream(&unknownField, QIODevice::WriteOnly);
+    unknownStream << quint8(0) << quint8(9) << quint32(3) << quint8(1) << qint8('k') << qint8('?');
+    unknownField += encodedString("PLAIN", QAmqpMetaType::LongString) +
+        encodedString("en_US", QAmqpMetaType::LongString);
+    add("unknown-start-table-field", QAmqpFrame::Connection, 10, unknownField);
+    QByteArray badVersion;
+    QDataStream versionStream(&badVersion, QIODevice::WriteOnly);
+    versionStream << quint8(1) << quint8(9) << QAmqpTable();
+    QAmqpFrame::writeAmqpField(versionStream, QAmqpMetaType::LongString, "PLAIN");
+    QAmqpFrame::writeAmqpField(versionStream, QAmqpMetaType::LongString, "en_US");
+    add("unsupported-start-version", QAmqpFrame::Connection, 10, badVersion);
+    add("unsupported-method", QAmqpFrame::Connection, 99, QByteArray());
+    add("client-only-method", QAmqpFrame::Basic, 40, QByteArray());
+}
+
+void tst_QAMQPParser::invalidMethodValues()
+{
+    QFETCH(int, methodClass);
+    QFETCH(int, methodId);
+    QFETCH(QByteArray, arguments);
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    QAmqpClient client;
+    QAmqpClientPrivate receiver(&client);
+    receiver.socket = new QSslSocket(&client);
+    receiver.channelMax = 16;
+    const qint32 originalFrameMax = receiver.frameMax;
+    MethodDispatchProbe probe;
+    receiver.methodHandlersByChannel[1].append(&probe);
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy disconnected(&client, &QAmqpClient::disconnected);
+    receiver.socket->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(receiver.socket->waitForConnected(1000));
+    QVERIFY(server.hasPendingConnections() || server.waitForNewConnection(1000));
+    QTcpSocket *peer = server.nextPendingConnection();
+    QVERIFY(peer);
+    QAmqpMethodFrame method(static_cast<QAmqpFrame::MethodClass>(methodClass), qint16(methodId));
+    method.setChannel(methodClass == QAmqpFrame::Connection ? 0 : 1);
+    method.setArguments(arguments);
+    QVERIFY(!QAmqpClientPrivate::validateMethodArguments(method));
+    QByteArray wire;
+    QDataStream output(&wire, QIODevice::WriteOnly);
+    output << method;
+    peer->write(wire);
+    peer->flush();
+    QVERIFY(receiver.socket->waitForReadyRead(1000));
+    receiver._q_readyRead();
+    QCOMPARE(probe.calls, 0);
+    QCOMPARE(connected.count(), 0);
+    QCOMPARE(disconnected.count(), 0);
+    QCOMPARE(receiver.channelMax, quint16(16));
+    QCOMPARE(receiver.frameMax, originalFrameMax);
+    QVERIFY(!receiver.connected);
+    QTRY_VERIFY(peer->bytesAvailable() > 0);
+    QDataStream response(peer->readAll());
+    QAmqpMethodFrame close;
+    response >> close;
+    QCOMPARE(close.methodClass(), QAmqpFrame::Connection);
+    QCOMPARE(close.id(), qint16(QAmqpClientPrivate::miClose));
+    QDataStream closeArguments(close.arguments());
+    quint16 code = 0;
+    closeArguments >> code;
+    QCOMPARE(code, quint16(QAMQP::FrameError));
+}
+
+void tst_QAMQPParser::unsignedTuneValuesRemainValid()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    QAmqpClient client;
+    QAmqpClientPrivate receiver(&client);
+    receiver.socket = new QSslSocket(&client);
+    receiver.socket->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(receiver.socket->waitForConnected(1000));
+    QVERIFY(server.hasPendingConnections() || server.waitForNewConnection(1000));
+    QTcpSocket *peer = server.nextPendingConnection();
+    QVERIFY(peer);
+    QAmqpMethodFrame tune(QAmqpFrame::Connection, QAmqpClientPrivate::miTune);
+    QByteArray arguments;
+    QDataStream argumentStream(&arguments, QIODevice::WriteOnly);
+    argumentStream << quint16(65535) << quint32(0xffffffffu) << quint16(65535);
+    tune.setArguments(arguments);
+    QByteArray wire;
+    QDataStream output(&wire, QIODevice::WriteOnly);
+    output << tune;
+    peer->write(wire);
+    peer->flush();
+    QVERIFY(receiver.socket->waitForReadyRead(1000));
+    receiver._q_readyRead();
+    QCOMPARE(receiver.channelMax, quint16(65535));
+    QCOMPARE(receiver.heartbeatDelay, quint16(65535));
+    QCOMPARE(receiver.frameMax, qint32(AMQP_FRAME_MAX));
 }
 
 void tst_QAMQPParser::deeplyNestedArray()

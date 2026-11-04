@@ -201,6 +201,159 @@ QAmqpTable QAmqpClientPrivate::mergeClientProperties(const QAmqpTable &defaults,
     return properties;
 }
 
+bool QAmqpClientPrivate::validateMethodArguments(const QAmqpMethodFrame &frame)
+{
+    QDataStream stream(frame.arguments());
+    const auto readString = [&stream](QAmqpMetaType::ValueType type, bool required) {
+        const QVariant value = QAmqpFrame::readAmqpField(stream, type);
+        return value.isValid() && (!required || !value.toString().isEmpty());
+    };
+    const auto readBits = [&stream](quint8 allowed) {
+        quint8 bits = 0;
+        stream >> bits;
+        return (bits & ~allowed) == 0;
+    };
+    const auto readClose = [&stream, &readString]() {
+        quint16 code = 0, methodClass = 0, method = 0;
+        stream >> code;
+        const bool validText = readString(QAmqpMetaType::ShortString, false);
+        stream >> methodClass >> method;
+        return code != 0 && validText;
+    };
+    bool valid = false;
+    switch (frame.methodClass()) {
+    case QAmqpFrame::Connection:
+        switch (frame.id()) {
+        case miStart: {
+            quint8 major = 0, minor = 0;
+            stream >> major >> minor;
+            QAmqpTable properties;
+            stream >> properties;
+            valid = major == 0 && minor == 9 &&
+                readString(QAmqpMetaType::LongString, true) &&
+                readString(QAmqpMetaType::LongString, true);
+            break;
+        }
+        case miSecure:
+            valid = readString(QAmqpMetaType::LongString, false);
+            break;
+        case miTune: {
+            quint16 channels = 0, heartbeat = 0;
+            quint32 maximumFrame = 0;
+            stream >> channels >> maximumFrame >> heartbeat;
+            valid = !maximumFrame || maximumFrame >= AMQP_FRAME_MIN_SIZE;
+            break;
+        }
+        case miOpenOk:
+            valid = readString(QAmqpMetaType::ShortString, false);
+            break;
+        case miClose:
+            valid = readClose();
+            break;
+        case miCloseOk:
+            valid = true;
+            break;
+        }
+        break;
+    case QAmqpFrame::Channel:
+        switch (frame.id()) {
+        case QAmqpChannelPrivate::miOpenOk:
+            valid = readString(QAmqpMetaType::LongString, false);
+            break;
+        case QAmqpChannelPrivate::miFlow:
+        case QAmqpChannelPrivate::miFlowOk:
+            valid = readBits(0x01);
+            break;
+        case QAmqpChannelPrivate::miClose:
+            valid = readClose();
+            break;
+        case QAmqpChannelPrivate::miCloseOk:
+            valid = true;
+            break;
+        }
+        break;
+    case QAmqpFrame::Exchange:
+        valid = frame.id() == QAmqpExchangePrivate::miDeclareOk ||
+            frame.id() == QAmqpExchangePrivate::miDeleteOk;
+        break;
+    case QAmqpFrame::Queue:
+        switch (frame.id()) {
+        case QAmqpQueuePrivate::miDeclareOk: {
+            valid = readString(QAmqpMetaType::ShortString, true);
+            quint32 messages = 0, consumers = 0;
+            stream >> messages >> consumers;
+            break;
+        }
+        case QAmqpQueuePrivate::miPurgeOk:
+        case QAmqpQueuePrivate::miDeleteOk: {
+            quint32 messages = 0;
+            stream >> messages;
+            valid = true;
+            break;
+        }
+        case QAmqpQueuePrivate::miBindOk:
+        case QAmqpQueuePrivate::miUnbindOk:
+            valid = true;
+            break;
+        }
+        break;
+    case QAmqpFrame::Basic:
+        switch (frame.id()) {
+        case QAmqpChannelPrivate::bmQosOk:
+        case QAmqpChannelPrivate::bmRecoverOk:
+            valid = true;
+            break;
+        case QAmqpChannelPrivate::bmConsumeOk:
+        case QAmqpChannelPrivate::bmCancelOk:
+            valid = readString(QAmqpMetaType::ShortString, true);
+            break;
+        case QAmqpChannelPrivate::bmReturn: {
+            quint16 code = 0;
+            stream >> code;
+            valid = code != 0 && readString(QAmqpMetaType::ShortString, false) &&
+                readString(QAmqpMetaType::ShortString, false) &&
+                readString(QAmqpMetaType::ShortString, false);
+            break;
+        }
+        case QAmqpChannelPrivate::bmDeliver:
+        case QAmqpChannelPrivate::bmGetOk: {
+            valid = frame.id() != QAmqpChannelPrivate::bmDeliver ||
+                readString(QAmqpMetaType::ShortString, true);
+            qulonglong deliveryTag = 0;
+            stream >> deliveryTag;
+            valid = valid && deliveryTag != 0 && readBits(0x01) &&
+                readString(QAmqpMetaType::ShortString, false) &&
+                readString(QAmqpMetaType::ShortString, false);
+            if (frame.id() == QAmqpChannelPrivate::bmGetOk) {
+                quint32 messages = 0;
+                stream >> messages;
+            }
+            break;
+        }
+        case QAmqpChannelPrivate::bmGetEmpty:
+            valid = readString(QAmqpMetaType::ShortString, false);
+            break;
+        case QAmqpChannelPrivate::bmAck:
+        case QAmqpChannelPrivate::bmNack: {
+            qulonglong deliveryTag = 0;
+            quint8 bits = 0;
+            stream >> deliveryTag >> bits;
+            const quint8 allowed = frame.id() == QAmqpChannelPrivate::bmNack ? 0x03 : 0x01;
+            valid = !(bits & ~allowed) && (deliveryTag != 0 || (bits & 0x01));
+            break;
+        }
+        }
+        break;
+    case QAmqpFrame::Confirm:
+        valid = frame.id() == QAmqpExchangePrivate::cmConfirmOk;
+        break;
+    case QAmqpFrame::Tx:
+        valid = frame.id() == 11 || frame.id() == 21 || frame.id() == 31;
+        break;
+    }
+    return valid && stream.status() == QDataStream::Ok && stream.atEnd();
+}
+
 bool QAmqpClientPrivate::validateDecodedFrame(const QAmqpFrame &frame,
                                                QDataStream::Status streamStatus,
                                                qint64 wirePayloadSize)
@@ -212,7 +365,7 @@ bool QAmqpClientPrivate::validateDecodedFrame(const QAmqpFrame &frame,
     switch (frame.type()) {
     case QAmqpFrame::Method: {
         const QAmqpMethodFrame &method = static_cast<const QAmqpMethodFrame &>(frame);
-        if (method.size() != wirePayloadSize || method.size() < 4)
+        if (method.size() != wirePayloadSize || method.size() < 4 || !validateMethodArguments(method))
             return false;
 
         switch (method.methodClass()) {
@@ -310,6 +463,7 @@ void QAmqpClientPrivate::_q_disconnect()
 // private slots
 void QAmqpClientPrivate::_q_socketConnected()
 {
+    closed = false;
     if (reconnectTimer)
         reconnectTimer->stop();
     if(reconnectFixedTimeout == false)
@@ -417,12 +571,22 @@ void QAmqpClientPrivate::_q_readyRead()
         }
 
         QDataStream streamB(&buffer, QIODevice::ReadOnly);
+        if (closed && type != QAmqpFrame::Method)
+            continue;
         switch (static_cast<QAmqpFrame::FrameType>(type)) {
         case QAmqpFrame::Method:
         {
             QAmqpMethodFrame frame;
             streamB >> frame;
+            if (closed) {
+                if (streamB.status() == QDataStream::Ok && frame.channel() == 0 &&
+                    frame.methodClass() == QAmqpFrame::Connection && frame.id() == miCloseOk &&
+                    frame.arguments().isEmpty())
+                    closeOk(frame);
+                continue;
+            }
             if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                closed = true;
                 close(QAMQP::FrameError, "invalid method frame payload");
                 return;
             }
@@ -847,13 +1011,14 @@ void QAmqpClientPrivate::tune(const QAmqpMethodFrame &frame)
 
     quint16 channel_max = 0,
            heartbeat_delay = 0;
-    qint32 frame_max = 0;
+    quint32 frame_max = 0;
 
     stream >> channel_max;
     stream >> frame_max;
     stream >> heartbeat_delay;
 
-    frameMax = negotiateFrameMax(frameMax, frame_max);
+    const qint32 serverFrameMax = frame_max ? qint32(qMin(frame_max, quint32(AMQP_FRAME_MAX))) : 0;
+    frameMax = negotiateFrameMax(frameMax, serverFrameMax);
     channelMax = negotiateChannelMax(channelMax, channel_max);
     heartbeatDelay = negotiateHeartbeat(heartbeatDelay, heartbeat_delay);
 
