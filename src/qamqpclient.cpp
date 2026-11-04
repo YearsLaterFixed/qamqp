@@ -186,6 +186,14 @@ qint16 QAmqpClientPrivate::negotiateHeartbeat(qint16 clientHeartbeat, qint16 ser
     return qMin(clientHeartbeat, serverHeartbeat);
 }
 
+QAmqpTable QAmqpClientPrivate::mergeClientProperties(const QAmqpTable &defaults,
+                                                      const QAmqpTable &custom)
+{
+    QAmqpTable properties = defaults;
+    properties.insert(custom);
+    return properties;
+}
+
 bool QAmqpClientPrivate::parseConnectionString(const QString &uri)
 {
     QUrl connectionString = QUrl::fromUserInput(uri);
@@ -614,15 +622,11 @@ void QAmqpClientPrivate::startOk()
     QByteArray arguments;
     QDataStream stream(&arguments, QIODevice::WriteOnly);
 
-    QAmqpTable clientProperties;
-    clientProperties["version"] = QString(QAMQP_VERSION);
-    clientProperties["platform"] = QString("Qt %1").arg(qVersion());
-    clientProperties["product"] = QString("QAMQP");
-#if QT_VERSION >= 0x060000
-    clientProperties.insert(customProperties);
-#else
-    clientProperties.unite(customProperties);
-#endif
+    QAmqpTable defaultProperties;
+    defaultProperties["version"] = QString(QAMQP_VERSION);
+    defaultProperties["platform"] = QString("Qt %1").arg(qVersion());
+    defaultProperties["product"] = QString("QAMQP");
+    QAmqpTable clientProperties = mergeClientProperties(defaultProperties, customProperties);
     stream << clientProperties;
 
     authenticator->write(stream);

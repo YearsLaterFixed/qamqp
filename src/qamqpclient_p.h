@@ -47,6 +47,8 @@ public:
     static quint16 negotiateChannelMax(quint16 clientChannelMax, quint16 serverChannelMax);
     static qint32 negotiateFrameMax(qint32 clientFrameMax, qint32 serverFrameMax);
     static qint16 negotiateHeartbeat(qint16 clientHeartbeat, qint16 serverHeartbeat);
+    static QAmqpTable mergeClientProperties(const QAmqpTable &defaults,
+                                             const QAmqpTable &custom);
 
     void closeConnection();
 
