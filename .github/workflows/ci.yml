@@ -121,7 +121,7 @@ jobs:
           set -euo pipefail
           for test in qamqpclient qamqpexchange qamqpqueue qamqpchannel; do
             test_dir="tests/auto/$test"
-            executable=$(sed -n 's/^TARGET[[:space:]]*=[[:space:]]*//p' "$test_dir/$test.pro" | head -n 1)
+            executable="$(sed -n 's/^TARGET[[:space:]]*=[[:space:]]*//p' "$test_dir/$test.pro" | head -n 1 | tr -d '[:space:]')"
             (cd "$test_dir" && timeout 25m "./$executable")
           done
 
