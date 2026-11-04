@@ -25,6 +25,7 @@ private Q_SLOTS:
     void frameMaxNegotiation();
     void heartbeatNegotiation_data();
     void heartbeatNegotiation();
+    void clientPropertiesMerge();
     void writeQueueReservation_data();
     void writeQueueReservation();
     void channelAllocationLimit();
@@ -278,6 +279,21 @@ void tst_QAMQPClient::heartbeatNegotiation()
     QFETCH(qint16, expectedHeartbeat);
 
     QCOMPARE(QAmqpClientPrivate::negotiateHeartbeat(clientHeartbeat, serverHeartbeat), expectedHeartbeat);
+}
+
+void tst_QAMQPClient::clientPropertiesMerge()
+{
+    QAmqpTable defaults;
+    defaults.insert("version", "0.6.0");
+    defaults.insert("platform", "Qt");
+    QAmqpTable custom;
+    custom.insert("version", "custom-version");
+    custom.insert("operator", "MFT");
+
+    const QAmqpTable merged = QAmqpClientPrivate::mergeClientProperties(defaults, custom);
+    QCOMPARE(merged.value("version").toString(), QString("custom-version"));
+    QCOMPARE(merged.value("platform").toString(), QString("Qt"));
+    QCOMPARE(merged.value("operator").toString(), QString("MFT"));
 }
 
 void tst_QAMQPClient::writeQueueReservation_data()
