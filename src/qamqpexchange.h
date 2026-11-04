@@ -95,6 +95,7 @@ Q_SIGNALS:
     void confirmsEnabled();
     void allMessagesDelivered();
     void publishRejected(QAmqpExchange::PublishError error);
+    void pendingPublishesCancelled(int count, qlonglong reservedBytes);
 
 public Q_SLOTS:
     // AMQP Exchange
@@ -107,6 +108,7 @@ public Q_SLOTS:
     void remove(int options = roIfUnused|roNoWait);
 
     // AMQP Basic
+    int cancelPendingPublishes();
     PublishResult publish(const QString &message, const QString &routingKey,
                           const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
                           int publishOptions = poNoOptions);

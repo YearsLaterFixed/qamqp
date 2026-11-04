@@ -46,6 +46,10 @@ private Q_SLOTS:
     void publishDeferral_data();
     void publishDeferral();
     void pendingPublishAdmission();
+    void deletingExchangeReleasesOnlyItsReservations();
+    void cancellingDeferredPublishesIsScoped();
+    void cancellingDeferredPublishesPreservesWriterBacklog();
+    void clientDestructionWithDeferredPublishes();
     void writeQueueReservation();
     void asynchronousWriteQueue();
     void controlFramesHaveIndependentBudget();
@@ -163,6 +167,67 @@ void tst_QAMQPFlow::pendingPublishAdmission()
     QCOMPARE(second->publish(QByteArray("m"), "routing-key", "text/plain"),
              QAmqpExchange::RejectedLimit);
     QCOMPARE(sharedBudgetClient.bufferedWriteBytes(), firstReservation);
+}
+
+void tst_QAMQPFlow::deletingExchangeReleasesOnlyItsReservations()
+{
+    QAmqpClient client;
+    QAmqpExchange *retained = client.createExchange("retained");
+    QCOMPARE(retained->publish("retained payload", "route"), QAmqpExchange::Queued);
+    const qlonglong retainedBytes = client.bufferedWriteBytes();
+    QVERIFY(retainedBytes > 0);
+
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        QAmqpExchange *exchange = client.createExchange("disposable");
+        QVERIFY(exchange);
+        QCOMPARE(exchange->publish("queued payload", "route"), QAmqpExchange::Queued);
+        QVERIFY(client.bufferedWriteBytes() > retainedBytes);
+        client.setMaxWriteQueueBytes(client.bufferedWriteBytes());
+        delete exchange;
+        QCOMPARE(client.bufferedWriteBytes(), retainedBytes);
+    }
+    delete retained;
+    QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
+}
+
+void tst_QAMQPFlow::cancellingDeferredPublishesIsScoped()
+{
+    QAmqpClient client;
+    QAmqpExchange *retained = client.createExchange("retained");
+    QCOMPARE(retained->publish("retained payload", "route"), QAmqpExchange::Queued);
+    const qlonglong retainedBytes = client.bufferedWriteBytes();
+    QAmqpExchange *exchange = client.createExchange("cancelled");
+    QSignalSpy cancelled(exchange, &QAmqpExchange::pendingPublishesCancelled);
+
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        QCOMPARE(exchange->publish("first payload", "route"), QAmqpExchange::Queued);
+        QCOMPARE(exchange->publish("second payload", "route"), QAmqpExchange::Queued);
+        const qlonglong cancelledBytes = client.bufferedWriteBytes() - retainedBytes;
+        QVERIFY(cancelledBytes > 0);
+        client.setMaxWriteQueueBytes(client.bufferedWriteBytes());
+        QCOMPARE(exchange->cancelPendingPublishes(), 2);
+        QCOMPARE(cancelled.count(), iteration + 1);
+        QCOMPARE(cancelled.last().at(0).toInt(), 2);
+        QCOMPARE(cancelled.last().at(1).toLongLong(), cancelledBytes);
+        QCOMPARE(client.bufferedWriteBytes(), retainedBytes);
+        QCOMPARE(exchange->cancelPendingPublishes(), 0);
+        QCOMPARE(cancelled.count(), iteration + 1);
+        QCOMPARE(client.bufferedWriteBytes(), retainedBytes);
+    }
+    delete exchange;
+    QCOMPARE(client.bufferedWriteBytes(), retainedBytes);
+    delete retained;
+    QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
+}
+
+void tst_QAMQPFlow::clientDestructionWithDeferredPublishes()
+{
+    QAmqpClient *client = new QAmqpClient;
+    QPointer<QAmqpExchange> exchange = client->createExchange("queued-at-destruction");
+    QCOMPARE(exchange->publish("queued payload", "route"), QAmqpExchange::Queued);
+    QVERIFY(client->bufferedWriteBytes() > 0);
+    delete client;
+    QVERIFY(exchange.isNull());
 }
 
 void tst_QAMQPFlow::writeQueueReservation()
@@ -288,6 +353,65 @@ static QByteArray encodeFrame(const QAmqpFrame &frame)
     QDataStream stream(&bytes, QIODevice::WriteOnly);
     stream << frame;
     return bytes;
+}
+
+void tst_QAMQPFlow::cancellingDeferredPublishesPreservesWriterBacklog()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QAmqpExchange *exchange = client.createExchange("mixed-backlog");
+    QAmqpExchange *retained = client.createExchange("retained-backlog");
+    QCOMPARE(retained->publish("retained payload", "route"), QAmqpExchange::Queued);
+    const qlonglong retainedBytes = client.bufferedWriteBytes();
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    PartialWriteSocket *socket = static_cast<PartialWriteSocket *>(writer.socket);
+    writer.connected = true;
+    QAmqpExchangePrivate *exchangeState = dynamic_cast<QAmqpExchangePrivate *>(
+        writer.methodHandlersByChannel.value(exchange->channelNumber()).first());
+    QVERIFY(exchangeState);
+    exchangeState->opened = true;
+    QCOMPARE(exchange->publish(QByteArray(128 * 1024, 'p'), "route", "application/octet-stream"),
+             QAmqpExchange::AcceptedForWrite);
+    QCOMPARE(writer.pendingWrites.size(), 1);
+    QVERIFY(!writer.inFlightWrites.isEmpty());
+    QVERIFY(writer.socket->bytesToWrite() > 0);
+    const QByteArray expected = writer.pendingWrites.head().data;
+    const qlonglong admittedBytes = writer.socketPendingBytes;
+    QVERIFY(admittedBytes > 0);
+
+    exchangeState->opened = false;
+    QCOMPARE(exchange->publish("cancelled payload", "route"), QAmqpExchange::Queued);
+    const qlonglong totalReservedBytes = client.bufferedWriteBytes();
+    QVERIFY(totalReservedBytes > retainedBytes + admittedBytes);
+    exchangeState->resetInternalState();
+    exchangeState->resetInternalState();
+    QCOMPARE(client.bufferedWriteBytes(), totalReservedBytes);
+    QSignalSpy cancelled(exchange, &QAmqpExchange::pendingPublishesCancelled);
+    QCOMPARE(exchange->cancelPendingPublishes(), 1);
+    QCOMPARE(cancelled.count(), 1);
+    QCOMPARE(cancelled.first().at(1).toLongLong(), totalReservedBytes - retainedBytes - admittedBytes);
+    QCOMPARE(exchangeState->pendingPublishBytes, qint64(0));
+    QVERIFY(exchangeState->pendingPublishes.isEmpty());
+    QCOMPARE(writer.socketPendingBytes, admittedBytes);
+    QCOMPARE(client.bufferedWriteBytes(), retainedBytes + admittedBytes);
+    QCOMPARE(writer.pendingWrites.size(), 1);
+    QCOMPARE(exchange->cancelPendingPublishes(), 0);
+    delete exchange;
+    QCOMPARE(client.bufferedWriteBytes(), retainedBytes + admittedBytes);
+
+    socket->maximumWriteSize = 4093;
+    writer.flushPendingWrites();
+    QTRY_COMPARE(peer->bytesAvailable(), qint64(expected.size()));
+    QCOMPARE(peer->readAll(), expected);
+    QTRY_COMPARE(writer.socketPendingBytes, qint64(0));
+    QTRY_COMPARE(client.bufferedWriteBytes(), retainedBytes);
+    delete retained;
+    QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
 }
 
 void tst_QAMQPFlow::controlFramesRespectPublishSequence()

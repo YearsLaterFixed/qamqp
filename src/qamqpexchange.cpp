@@ -31,6 +31,24 @@ QAmqpExchangePrivate::QAmqpExchangePrivate(QAmqpExchange *q)
 {
 }
 
+QAmqpExchangePrivate::~QAmqpExchangePrivate()
+{
+    clearPendingPublishes();
+}
+
+qint64 QAmqpExchangePrivate::clearPendingPublishes()
+{
+    qint64 reservedBytes = 0;
+    foreach (const PendingPublish &publish, pendingPublishes) {
+        if (publish.hasWriteReservation)
+            reservedBytes += publish.encoded.size();
+    }
+    pendingPublishes.clear();
+    pendingPublishBytes = 0;
+    releaseWriteBytes(reservedBytes);
+    return reservedBytes;
+}
+
 void QAmqpExchangePrivate::resetInternalState()
 {
     QAmqpChannelPrivate::resetInternalState();
@@ -302,6 +320,16 @@ void QAmqpExchange::remove(int options)
 
     frame.setArguments(arguments, stream.status());
     d->sendFrame(frame);
+}
+
+int QAmqpExchange::cancelPendingPublishes()
+{
+    Q_D(QAmqpExchange);
+    const int count = d->pendingPublishes.size();
+    const qlonglong reservedBytes = d->clearPendingPublishes();
+    if (count)
+        Q_EMIT pendingPublishesCancelled(count, reservedBytes);
+    return count;
 }
 
 QAmqpExchange::PublishResult QAmqpExchange::publish(
