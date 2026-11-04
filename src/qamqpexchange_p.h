@@ -31,6 +31,7 @@ public:
     };
 
     QAmqpExchangePrivate(QAmqpExchange *q);
+    virtual ~QAmqpExchangePrivate();
     static QString typeToString(QAmqpExchange::ExchangeType type);
     static bool shouldDeferPublish(bool channelOpened, bool flowActive);
 
@@ -41,6 +42,7 @@ public:
     QAmqpExchange::PublishResult sendPublish(const PendingPublish &publish);
     QByteArray serializePublish(const PendingPublish &publish) const;
     void flushPendingPublishes();
+    qint64 clearPendingPublishes();
 
     // method handler related
     virtual void _q_disconnected();

@@ -137,6 +137,16 @@ stalled peer drain, and never introduces blocking writes or unbounded buffering.
 Short strings exceeding 255 UTF-8 bytes are rejected before admission, without
 truncation or a write reservation. Invalid publishes return `RejectedInvalid`
 and emit `publishRejected(InvalidShortString)` once.
+`cancelPendingPublishes()` explicitly cancels only this exchange's deferred
+publishes, returns their count, and emits
+`pendingPublishesCancelled(count, reservedBytes)` once when that count is nonzero.
+Calling it again on an empty queue returns zero without emitting a notification.
+Cancellation releases the corresponding client budget immediately, but cannot
+retract publishes already admitted to the socket writer or delivered to a broker.
+Destroying an exchange also releases its remaining deferred reservations without
+changing another exchange's reservations or the writer backlog. Deferred entries
+and their reservations remain intact across disconnect/reset until replay,
+explicit cancellation, or exchange destruction.
 
 AMQP Support
 ------------

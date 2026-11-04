@@ -118,6 +118,12 @@ bool QAmqpChannelPrivate::reserveWriteBytes(qint64 bytes)
     return client && client->d_func()->reserveWriteBytes(bytes);
 }
 
+void QAmqpChannelPrivate::releaseWriteBytes(qint64 bytes)
+{
+    if (client)
+        client->d_func()->releaseWriteBytes(bytes);
+}
+
 void QAmqpChannelPrivate::resetInternalState()
 {
     flowActive = true;
