@@ -111,8 +111,10 @@ void tst_QAMQPExchange::invalidDeclaration()
 {
     QAmqpExchange *exchange = client->createExchange("test-invalid-declaration");
     exchange->declare("invalidExchangeType");
-    QVERIFY(waitForSignal(client.data(), SIGNAL(error(QAMQP::Error))));
-    QCOMPARE(client->error(), QAMQP::CommandInvalidError);
+
+    QVERIFY(waitForSignal(exchange, SIGNAL(error(QAMQP::Error))));
+    QCOMPARE(exchange->error(), QAMQP::PreconditionFailedError);
+    QVERIFY(client->isConnected());
 }
 
 void tst_QAMQPExchange::invalidRedeclaration()
