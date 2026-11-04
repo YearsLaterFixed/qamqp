@@ -67,6 +67,18 @@ bound memory for `coNoAck` consumers. Drain the queue promptly with `dequeue()`;
 `QAmqpQueue` no longer publicly inherits `QQueue` so callers cannot bypass byte
 accounting through inherited mutators.
 
+#### publish buffering and delivery
+`QAmqpExchange::publish()` returns a `PublishResult` describing local admission:
+`AcceptedForWrite`, `Queued`, `RejectedLimit`, or `NotConnected`. `Queued` and
+`AcceptedForWrite` do not mean the broker received or accepted the message; use
+publisher confirms when broker acknowledgement is required. A deferred publish
+queue is limited to 1,000 messages or 16 MiB of fully serialized data per
+exchange. The client also bounds its asynchronous write backlog; its default
+budget is 16 MiB and can be changed with `QAmqpClient::setMaxWriteQueueBytes()`.
+Setting the client budget to zero disables writes. Exceeding either limit is
+reported to the caller instead of silently dropping a publish. Writes are
+drained asynchronously, so a slow peer does not block the Qt event loop.
+
 AMQP Support
 ------------
 
