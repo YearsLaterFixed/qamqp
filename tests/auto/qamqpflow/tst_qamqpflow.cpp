@@ -1,4 +1,7 @@
 #include <QtTest/QtTest>
+/* Fork modifications Copyright (C) 2026 Fabian Suhr (YearsLaterFixed).
+ * Modified: 2026-11-04. See LICENSING.md at repository root for inherited rights.
+ * Fork/Contact: https://github.com/YearsLaterFixed/qamqp */
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QSslSocket>

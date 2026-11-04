@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright (C) 2026 Fabian Suhr (YearsLaterFixed)
 name: QAMQP CI
 
 on:
@@ -5,6 +7,12 @@ on:
   push:
     branches:
       - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   broker-independent:
@@ -15,7 +23,7 @@ jobs:
       matrix:
         qt: ["5.15.2", "6.5.3"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -60,7 +68,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -129,8 +137,29 @@ jobs:
           for test in qamqpclient qamqpexchange qamqpqueue qamqpchannel; do
             test_dir="tests/auto/$test"
             executable="$(sed -n 's/^TARGET[[:space:]]*=[[:space:]]*//p' "$test_dir/$test.pro" | head -n 1 | tr -d '[:space:]')"
-            (cd "$test_dir" && timeout 25m "./$executable")
+            (cd "$test_dir" && timeout 25m "./$executable" -o "$RUNNER_TEMP/$test.txt",txt) || {
+              cat "$RUNNER_TEMP/$test.txt"
+              exit 1
+            }
+            cat "$RUNNER_TEMP/$test.txt"
           done
+
+      - name: Run 100-cycle multi-channel reconnect soak
+        working-directory: tests/auto/qamqpclient
+        env:
+          QAMQP_SOAK_CYCLES: '100'
+        run: |
+          ./tst_qamqpclient multiChannelReconnectSoak -o "$RUNNER_TEMP/reconnect-soak.txt",txt
+          cat "$RUNNER_TEMP/reconnect-soak.txt"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: broker-validation
+          path: |
+            ${{ runner.temp }}/qamqp*.txt
+            ${{ runner.temp }}/reconnect-soak.txt
+          if-no-files-found: warn
 
       - name: RabbitMQ diagnostics on failure
         if: failure()
@@ -138,3 +167,61 @@ jobs:
       - name: Stop RabbitMQ
         if: always()
         run: docker rm -f qamqp-rabbitmq || true
+
+  source-packages:
+    name: Git-free packages (Qt ${{ matrix.qt }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        qt: ['5.15.2', '6.5.3']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ matrix.qt }}
+          host: linux
+          target: desktop
+          cache: true
+      - name: Install package tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake binutils
+      - name: Build and verify source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar --prefix=qamqp-1.0.0/ HEAD | gzip -n > "$RUNNER_TEMP/qamqp-1.0.0.tar.gz"
+          mkdir "$RUNNER_TEMP/extracted"
+          tar -xzf "$RUNNER_TEMP/qamqp-1.0.0.tar.gz" -C "$RUNNER_TEMP/extracted"
+          bash "$RUNNER_TEMP/extracted/qamqp-1.0.0/tests/files/ci/check-release.sh" \
+            "$RUNNER_TEMP/package-check" 2>&1 | tee "$RUNNER_TEMP/package-validation.txt"
+          cd "$RUNNER_TEMP"
+          sha256sum qamqp-1.0.0.tar.gz package-validation.txt > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source-package-qt-${{ matrix.qt }}
+          path: |
+            ${{ runner.temp }}/qamqp-1.0.0.tar.gz
+            ${{ runner.temp }}/package-validation.txt
+            ${{ runner.temp }}/SHA256SUMS
+          if-no-files-found: error
+
+  sanitizers:
+    name: Parser and flow ASan UBSan
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install sanitizer baseline
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake qtbase5-dev
+      - name: Run instrumented parser and flow suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/files/ci/run-sanitizers.sh "$RUNNER_TEMP/sanitizers" 2>&1 | tee "$RUNNER_TEMP/sanitizers.txt"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sanitizer-validation
+          path: ${{ runner.temp }}/sanitizers.txt
+          if-no-files-found: error

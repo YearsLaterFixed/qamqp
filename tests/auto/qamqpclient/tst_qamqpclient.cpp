@@ -1,4 +1,7 @@
 #include <QtTest/QtTest>
+/* Fork modifications Copyright (C) 2026 Fabian Suhr (YearsLaterFixed).
+ * Modified: 2026-11-04. See LICENSING.md at repository root for inherited rights.
+ * Fork/Contact: https://github.com/YearsLaterFixed/qamqp */
 #include <QProcess>
 #include <QSslSocket>
 #include <QTcpServer>
@@ -47,6 +50,7 @@ private Q_SLOTS:
     void sslConnect();
     void sslRejectsUntrustedCertificate();
     void sslRejectsWrongPeerName();
+    void multiChannelReconnectSoak();
 
 private:
     QSslConfiguration createSslConfiguration();
@@ -81,6 +85,98 @@ public:
     ~BrokerRestartGuard() { if (stopped) runBrokerCommand("start_app"); }
     bool stopped;
 };
+
+void tst_QAMQPClient::multiChannelReconnectSoak()
+{
+    bool configured = false;
+    const int requested = qEnvironmentVariableIntValue("QAMQP_SOAK_CYCLES", &configured);
+    QVERIFY2(qEnvironmentVariableIsEmpty("QAMQP_SOAK_CYCLES") || configured,
+             "QAMQP_SOAK_CYCLES must be an integer");
+    const int cycles = configured ? requested : 3;
+    QVERIFY(cycles >= 1 && cycles <= 10000);
+    const int streams = 6;
+    const int perStream = 3;
+    QVector<int> consuming(streams, 0), received(streams, 0);
+    QList<QAmqpQueue *> queues;
+    QList<QAmqpExchange *> exchanges;
+    ReconnectTestClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
+    const QString prefix = "soak-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    for (int index = 0; index < streams; ++index) {
+        const QString name = prefix + QString::number(index);
+        QAmqpExchange *exchange = client.createExchange(name);
+        QAmqpQueue *queue = client.createQueue(name);
+        QVERIFY(exchange);
+        QVERIFY(queue);
+        queue->setMaxBufferedMessages(perStream);
+        queue->setMaxBufferedBytes(perStream * 16384);
+        queue->setMaxMessageSize(16384);
+        exchanges.append(exchange);
+        queues.append(queue);
+        QObject::connect(&client, &QAmqpClient::connected, &client,
+                         [exchange] { exchange->declare(QAmqpExchange::FanOut, QAmqpExchange::Durable); });
+        QObject::connect(exchange, &QAmqpExchange::declared, &client,
+                         [queue] { queue->declare(QAmqpQueue::Durable); });
+        QObject::connect(queue, &QAmqpQueue::declared, &client,
+                         [queue, exchange] { queue->bind(exchange, "route"); });
+        QObject::connect(queue, &QAmqpQueue::bound, &client,
+                         [queue] { queue->consume(QAmqpQueue::coNoAck); });
+        QObject::connect(queue, &QAmqpQueue::consuming, &client,
+                         [&, index](const QString &) { ++consuming[index]; });
+        QObject::connect(queue, &QAmqpQueue::messageReceived, &client,
+                         [&, index] { ++received[index]; });
+    }
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy disconnected(&client, &QAmqpClient::disconnected);
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    QElapsedTimer elapsed;
+    elapsed.start();
+    for (int cycle = 0; cycle < cycles; ++cycle) {
+        client.connectToHost();
+        QTRY_COMPARE(connected.count(), cycle + 1);
+        for (int index = 0; index < streams; ++index) {
+            QTRY_COMPARE(consuming[index], cycle + 1);
+            QCOMPARE(client.createExchange(exchanges[index]->name()), exchanges[index]);
+            QCOMPARE(client.createQueue(queues[index]->name()), queues[index]);
+            for (int message = 0; message < perStream; ++message) {
+                const QByteArray payload = QByteArray::number(cycle) + ':' +
+                    QByteArray::number(index) + ':' + QByteArray::number(message) +
+                    QByteArray(8192, char('a' + index));
+                QCOMPARE(exchanges[index]->publish(payload, "route", "application/octet-stream"),
+                         QAmqpExchange::AcceptedForWrite);
+            }
+        }
+        for (int index = 0; index < streams; ++index) {
+            QTRY_COMPARE(received[index], (cycle + 1) * perStream);
+            QCOMPARE(queues[index]->bufferedMessageCount(), perStream);
+            for (int message = 0; message < perStream; ++message) {
+                const QByteArray expected = QByteArray::number(cycle) + ':' +
+                    QByteArray::number(index) + ':' + QByteArray::number(message) +
+                    QByteArray(8192, char('a' + index));
+                QCOMPARE(queues[index]->dequeue().payload(), expected);
+            }
+            QCOMPARE(queues[index]->bufferedMessageBytes(), qlonglong(0));
+            QCOMPARE(queues[index]->bufferedMessageCount(), 0);
+        }
+        QTRY_COMPARE(client.bufferedWriteBytes(), qlonglong(0));
+        QCOMPARE(client.findChildren<QAmqpQueue *>().size(), streams);
+        QCOMPARE(client.findChildren<QAmqpExchange *>().size(), streams);
+        QCOMPARE(client.state()->nextChannelNumber, quint16(streams * 2));
+        client.disconnectFromHost();
+        QTRY_COMPARE(disconnected.count(), cycle + 1);
+        QCOMPARE(client.state()->bufferedControlBytes, qint64(0));
+        QCOMPARE(client.state()->socketPendingBytes, qint64(0));
+        QVERIFY(client.state()->pendingWrites.isEmpty());
+        QVERIFY(client.state()->controlWrites.isEmpty());
+        QVERIFY(client.state()->inFlightWrites.isEmpty());
+        QVERIFY(client.state()->pendingChannelCloses.isEmpty());
+        QCOMPARE(errors.count(), 0);
+    }
+    qInfo() << "Reconnect soak PASS: cycles" << cycles << "channels" << streams * 2
+            << "messages" << cycles * streams * perStream << "elapsed-ms" << elapsed.elapsed()
+            << "final-buffered-bytes" << client.bufferedWriteBytes();
+}
 
 QSslConfiguration tst_QAMQPClient::createSslConfiguration()
 {

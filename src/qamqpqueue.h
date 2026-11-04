@@ -1,7 +1,11 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
  * Copyright (C) 2012-2014 Alexey Shcherbakov
  * Copyright (C) 2014-2015 Matt Broadstone
- * Contact: https://github.com/mbroadst/qamqp
+ * Copyright (C) 2026 Fabian Suhr (YearsLaterFixed)
+ * Modified: 2026-11-04 - fork maintenance and release hardening.
+ * Upstream: https://github.com/mbroadst/qamqp
+ * Fork/Contact: https://github.com/YearsLaterFixed/qamqp
  *
  * This file is part of the QAMQP Library.
  *
