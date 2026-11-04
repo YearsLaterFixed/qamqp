@@ -42,6 +42,7 @@ class QAMQP_EXPORT QAmqpClient : public QObject
     Q_PROPERTY(qint16 channelMax READ channelMax WRITE setChannelMax)
     Q_PROPERTY(qint32 frameMax READ frameMax WRITE setFrameMax)
     Q_PROPERTY(qint16 heartbeatDelay READ heartbeatDelay() WRITE setHeartbeatDelay)
+    Q_PROPERTY(qlonglong maxWriteQueueBytes READ maxWriteQueueBytes WRITE setMaxWriteQueueBytes)
 
 public:
     explicit QAmqpClient(QObject *parent = 0);
@@ -81,6 +82,10 @@ public:
     qint16 heartbeatDelay() const;
     void setHeartbeatDelay(qint16 delay);
 
+    qlonglong maxWriteQueueBytes() const;
+    void setMaxWriteQueueBytes(qlonglong bytes);
+    qlonglong bufferedWriteBytes() const;
+
     int writeTimeout() const;
     void setWriteTimeout(int msecs);
 
@@ -118,6 +123,8 @@ Q_SIGNALS:
     void error(QAMQP::Error error);
     void socketErrorOccurred(QAbstractSocket::SocketError error);
     void socketStateChanged(QAbstractSocket::SocketState state);
+    void writeQueueOverflow(qlonglong attemptedBytes);
+    void writeQueueDiscarded(qlonglong discardedBytes);
     void sslErrors(const QList<QSslError> &errors);
     
 public Q_SLOTS:
@@ -142,6 +149,7 @@ private:
 
     friend class QAmqpChannelPrivate;
     friend class QAmqpQueuePrivate;
+    friend class QAmqpExchangePrivate;
 
 };
 

@@ -50,6 +50,14 @@ public:
     };
     Q_DECLARE_FLAGS(PublishOptions, PublishOption)
 
+    enum PublishResult {
+        AcceptedForWrite,
+        Queued,
+        RejectedLimit,
+        NotConnected
+    };
+    Q_ENUM(PublishResult)
+
     enum RemoveOption {
         roForce = 0x0,
         roIfUnused = 0x01,
@@ -92,16 +100,16 @@ public Q_SLOTS:
     void remove(int options = roIfUnused|roNoWait);
 
     // AMQP Basic
-    void publish(const QString &message, const QString &routingKey,
-                 const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
-                 int publishOptions = poNoOptions);
-    void publish(const QByteArray &message, const QString &routingKey, const QString &mimeType,
-                 const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
-                 int publishOptions = poNoOptions);
-    void publish(const QByteArray &message, const QString &routingKey,
-                 const QString &mimeType, const QAmqpTable &headers,
-                 const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
-                 int publishOptions = poNoOptions);
+    PublishResult publish(const QString &message, const QString &routingKey,
+                          const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
+                          int publishOptions = poNoOptions);
+    PublishResult publish(const QByteArray &message, const QString &routingKey, const QString &mimeType,
+                          const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
+                          int publishOptions = poNoOptions);
+    PublishResult publish(const QByteArray &message, const QString &routingKey,
+                          const QString &mimeType, const QAmqpTable &headers,
+                          const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
+                          int publishOptions = poNoOptions);
 
 protected:
     virtual void channelOpened();
