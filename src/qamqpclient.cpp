@@ -1,4 +1,5 @@
 #include <QTimer>
+#include <QBuffer>
 #include <QTextStream>
 #include <QStringList>
 #include <QSslSocket>
@@ -426,13 +427,28 @@ void QAmqpClientPrivate::_q_readyRead()
 
 void QAmqpClientPrivate::sendFrame(const QAmqpFrame &frame)
 {
+    Q_Q(QAmqpClient);
     if (socket->state() != QAbstractSocket::ConnectedState) {
         qAmqpDebug() << Q_FUNC_INFO << "socket not connected: " << socket->state();
         return;
     }
 
-    QDataStream stream(socket);
+    QByteArray encoded;
+    QBuffer buffer(&encoded);
+    if (!buffer.open(QIODevice::WriteOnly))
+        return;
+    QDataStream stream(&buffer);
     stream << frame;
+    if (stream.status() != QDataStream::Ok) {
+        error = QAMQP::FrameError;
+        errorString = "AMQP frame contains an invalid field";
+        Q_EMIT q->error(error);
+        return;
+    }
+
+    if (socket->write(encoded) < 0) {
+        errorString = socket->errorString();
+    }
 }
 
 void QAmqpClientPrivate::closeConnection()
@@ -627,7 +643,7 @@ void QAmqpClientPrivate::startOk()
 
     authenticator->write(stream);
     QAmqpFrame::writeAmqpField(stream, QAmqpMetaType::ShortString, QLatin1String("en_US"));
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
 
     qAmqpDebug("<- connection#startOk()");  // @todo: fill this out
     sendFrame(frame);
@@ -669,7 +685,7 @@ void QAmqpClientPrivate::open()
     qAmqpDebug("<- connection#open( virtualHost=%s, reserved-1=%d, reserved-2=%d )",
                qPrintable(virtualHost), 0, 0);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     sendFrame(frame);
 }
 
@@ -686,7 +702,7 @@ void QAmqpClientPrivate::close(int code, const QString &text, int classId, int m
                code, qPrintable(text), classId, methodId);
 
     QAmqpMethodFrame frame(QAmqpFrame::Connection, QAmqpClientPrivate::miClose);
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     sendFrame(frame);
 }
 

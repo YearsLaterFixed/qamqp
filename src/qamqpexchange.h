@@ -50,6 +50,11 @@ public:
     };
     Q_DECLARE_FLAGS(PublishOptions, PublishOption)
 
+    enum PublishError {
+        InvalidShortString
+    };
+    Q_ENUM(PublishError)
+
     enum RemoveOption {
         roForce = 0x0,
         roIfUnused = 0x01,
@@ -80,6 +85,7 @@ Q_SIGNALS:
 
     void confirmsEnabled();
     void allMessagesDelivered();
+    void publishRejected(QAmqpExchange::PublishError error);
 
 public Q_SLOTS:
     // AMQP Exchange
@@ -119,5 +125,6 @@ private:
 
 Q_DECLARE_OPERATORS_FOR_FLAGS(QAmqpExchange::ExchangeOptions)
 Q_DECLARE_METATYPE(QAmqpExchange::ExchangeType)
+Q_DECLARE_METATYPE(QAmqpExchange::PublishError)
 
 #endif // QAMQPEXCHANGE_H

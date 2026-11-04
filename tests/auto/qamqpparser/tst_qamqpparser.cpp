@@ -2,6 +2,8 @@
 #include <QRandomGenerator>
 
 #include "qamqpframe_p.h"
+#include "qamqpclient.h"
+#include "qamqpexchange.h"
 #include "qamqpqueue.h"
 #include "qamqpqueue_p.h"
 #include "qamqptable.h"
@@ -17,6 +19,10 @@ class tst_QAMQPParser : public QObject
 private Q_SLOTS:
     void shortStringBoundaries_data();
     void shortStringBoundaries();
+    void shortStringWriteBoundaries_data();
+    void shortStringWriteBoundaries();
+    void invalidShortStringFramesAreNotWritten();
+    void publishRejectsInvalidShortStrings();
 
     void fieldSizeBoundaries_data();
     void fieldSizeBoundaries();
@@ -83,6 +89,81 @@ void tst_QAMQPParser::shortStringBoundaries()
         // must be rejected cleanly rather than reading garbage/out-of-bounds data
         QVERIFY(!result.isValid() || result.toString().isEmpty());
     }
+}
+
+void tst_QAMQPParser::shortStringWriteBoundaries_data()
+{
+    QTest::addColumn<QString>("text");
+    QTest::addColumn<bool>("accepted");
+
+    QTest::newRow("ascii-255") << QString(255, QLatin1Char('a')) << true;
+    QTest::newRow("ascii-256") << QString(256, QLatin1Char('a')) << false;
+    QTest::newRow("utf8-exact-255")
+        << (QString(253, QLatin1Char('a')) + QString::fromUtf8("\xC3\xA9")) << true;
+    QTest::newRow("utf8-over-255")
+        << (QString(254, QLatin1Char('a')) + QString::fromUtf8("\xC3\xA9")) << false;
+    QTest::newRow("non-bmp-exact-255")
+        << (QString(251, QLatin1Char('a')) + QString::fromUtf8("\xF0\x9F\x9A\x80")) << true;
+    QTest::newRow("non-bmp-over-255")
+        << (QString(252, QLatin1Char('a')) + QString::fromUtf8("\xF0\x9F\x9A\x80")) << false;
+}
+
+void tst_QAMQPParser::shortStringWriteBoundaries()
+{
+    QFETCH(QString, text);
+    QFETCH(bool, accepted);
+
+    QByteArray encoded;
+    QDataStream out(&encoded, QIODevice::WriteOnly);
+    QCOMPARE(QAmqpFrame::writeAmqpField(out, QAmqpMetaType::ShortString, text), accepted);
+    QCOMPARE(out.status() == QDataStream::Ok, accepted);
+    if (accepted) {
+        QDataStream in(encoded);
+        QCOMPARE(QAmqpFrame::readAmqpField(in, QAmqpMetaType::ShortString).toString(), text);
+        QCOMPARE(encoded.at(0), char(text.toUtf8().size()));
+    } else {
+        QVERIFY(encoded.isEmpty());
+    }
+}
+
+void tst_QAMQPParser::invalidShortStringFramesAreNotWritten()
+{
+    QByteArray arguments;
+    QDataStream argumentsStream(&arguments, QIODevice::WriteOnly);
+    QVERIFY(!QAmqpFrame::writeAmqpField(argumentsStream, QAmqpMetaType::ShortString,
+                                         QString(256, QLatin1Char('x'))));
+
+    QAmqpMethodFrame method(QAmqpFrame::Basic, 40);
+    method.setArguments(arguments, argumentsStream.status());
+    QByteArray methodFrame;
+    QDataStream methodStream(&methodFrame, QIODevice::WriteOnly);
+    methodStream << method;
+    QCOMPARE(methodStream.status(), QDataStream::WriteFailed);
+    QVERIFY(methodFrame.isEmpty());
+
+    QAmqpContentFrame content(QAmqpFrame::Basic);
+    content.setProperty(QAmqpMessage::ContentType, QString(256, QLatin1Char('x')));
+    QByteArray contentFrame;
+    QDataStream contentStream(&contentFrame, QIODevice::WriteOnly);
+    contentStream << content;
+    QCOMPARE(contentStream.status(), QDataStream::WriteFailed);
+    QVERIFY(contentFrame.isEmpty());
+}
+
+void tst_QAMQPParser::publishRejectsInvalidShortStrings()
+{
+    QAmqpClient client;
+    QAmqpExchange *exchange = client.createExchange("valid-exchange");
+    QVERIFY(exchange);
+    QSignalSpy rejected(exchange, &QAmqpExchange::publishRejected);
+
+    exchange->publish(QByteArray("payload"), QString(256, QLatin1Char('r')), "text/plain");
+    QCOMPARE(rejected.count(), 1);
+    QCOMPARE(rejected.at(0).at(0).value<QAmqpExchange::PublishError>(),
+             QAmqpExchange::InvalidShortString);
+
+    exchange->publish(QByteArray("payload"), "valid-key", QString(256, QLatin1Char('m')));
+    QCOMPARE(rejected.count(), 2);
 }
 
 void tst_QAMQPParser::fieldSizeBoundaries_data()

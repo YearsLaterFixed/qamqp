@@ -91,7 +91,7 @@ void QAmqpExchangePrivate::declare()
                options.testFlag(QAmqpExchange::Passive), options.testFlag(QAmqpExchange::Durable),
                options.testFlag(QAmqpExchange::NoWait));
 
-    frame.setArguments(args);
+    frame.setArguments(args, stream.status());
     sendFrame(frame);
     delayedDeclare = false;
 }
@@ -227,6 +227,7 @@ void QAmqpExchangePrivate::handleAckOrNack(const QAmqpMethodFrame &frame)
 QAmqpExchange::QAmqpExchange(int channelNumber, QAmqpClient *parent)
     : QAmqpChannel(new QAmqpExchangePrivate(this), parent)
 {
+    qRegisterMetaType<QAmqpExchange::PublishError>("QAmqpExchange::PublishError");
     Q_D(QAmqpExchange);
     d->init(channelNumber, parent);
 }
@@ -296,7 +297,7 @@ void QAmqpExchange::remove(int options)
     qAmqpDebug("<- exchange#delete( exchange=%s, if-unused=%d, no-wait=%d )",
                qPrintable(d->name), options & QAmqpExchange::roIfUnused, options & QAmqpExchange::roNoWait);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     d->sendFrame(frame);
 }
 
@@ -319,6 +320,26 @@ void QAmqpExchange::publish(const QByteArray &message, const QString &routingKey
                             const QAmqpMessage::PropertyHash &properties, int publishOptions)
 {
     Q_D(QAmqpExchange);
+    if (!QAmqpFrame::isValidShortString(d->name) ||
+        !QAmqpFrame::isValidShortString(routingKey)) {
+        Q_EMIT publishRejected(InvalidShortString);
+        return;
+    }
+
+    QAmqpContentFrame validationFrame(QAmqpFrame::Basic);
+    validationFrame.setProperty(QAmqpMessage::ContentType, mimeType);
+    validationFrame.setProperty(QAmqpMessage::ContentEncoding, "utf-8");
+    validationFrame.setProperty(QAmqpMessage::Headers, headers);
+    QAmqpMessage::PropertyHash::ConstIterator validationIt;
+    QAmqpMessage::PropertyHash::ConstIterator validationEnd = properties.constEnd();
+    for (validationIt = properties.constBegin(); validationIt != validationEnd; ++validationIt)
+        validationFrame.setProperty(validationIt.key(), validationIt.value());
+    validationFrame.setBodySize(message.size());
+    if (validationFrame.size() < 0) {
+        Q_EMIT publishRejected(InvalidShortString);
+        return;
+    }
+
     QAmqpExchangePrivate::PendingPublish publish;
     publish.message = message;
     publish.routingKey = routingKey;
@@ -346,9 +367,11 @@ void QAmqpExchange::publish(const QByteArray &message, const QString &routingKey
 
 void QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
 {
-    if (nextDeliveryTag > 0) {
-        unconfirmedDeliveryTags.append(nextDeliveryTag);
-        nextDeliveryTag++;
+    Q_Q(QAmqpExchange);
+    if (!QAmqpFrame::isValidShortString(name) ||
+        !QAmqpFrame::isValidShortString(publish.routingKey)) {
+        Q_EMIT q->publishRejected(QAmqpExchange::InvalidShortString);
+        return;
     }
 
     QAmqpMethodFrame frame(QAmqpFrame::Basic, QAmqpExchangePrivate::bmPublish);
@@ -367,8 +390,11 @@ void QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
                publish.publishOptions & QAmqpExchange::poMandatory,
                publish.publishOptions & QAmqpExchange::poImmediate);
 
-    frame.setArguments(arguments);
-    sendFrame(frame);
+    if (out.status() != QDataStream::Ok) {
+        Q_EMIT q->publishRejected(QAmqpExchange::InvalidShortString);
+        return;
+    }
+    frame.setArguments(arguments, out.status());
 
     QAmqpContentFrame content(QAmqpFrame::Basic);
     content.setChannel(channelNumber);
@@ -381,6 +407,17 @@ void QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
     for (it = publish.properties.constBegin(); it != itEnd; ++it)
         content.setProperty(it.key(), it.value());
     content.setBodySize(publish.message.size());
+    if (content.size() < 0) {
+        Q_EMIT q->publishRejected(QAmqpExchange::InvalidShortString);
+        return;
+    }
+
+    if (nextDeliveryTag > 0) {
+        unconfirmedDeliveryTags.append(nextDeliveryTag);
+        nextDeliveryTag++;
+    }
+
+    sendFrame(frame);
     sendFrame(content);
 
     int fullSize = publish.message.size();
