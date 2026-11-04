@@ -31,6 +31,15 @@ public:
 
     static bool isAcceptableBodySize(qlonglong declaredBodySize);
     static bool isAcceptableBodyChunk(qlonglong remainingSize, qlonglong chunkSize);
+    static QAmqpQueue::OverflowReason overflowReason(int bufferedCount,
+                                                      qlonglong bufferedBytes,
+                                                      qlonglong declaredBodySize,
+                                                      int maxBufferedMessages,
+                                                      qlonglong maxBufferedBytes,
+                                                      qlonglong maxMessageSize);
+    void enqueueMessage(const QAmqpMessage &message);
+    QAmqpMessage dequeueMessage();
+    void clearMessages();
 
     virtual void resetInternalState();
 
@@ -66,6 +75,14 @@ public:
 
     qint32 messageCount;
     qint32 consumerCount;
+    QQueue<QAmqpMessage> messages;
+    qlonglong bufferedBytes;
+    int maxBufferedMessages;
+    qlonglong maxBufferedBytes;
+    qlonglong maxMessageSize;
+    bool discardingMessage;
+    QAmqpQueue::OverflowReason discardReason;
+    qlonglong discardedDeliveryTag;
 
     Q_DECLARE_PUBLIC(QAmqpQueue)
 

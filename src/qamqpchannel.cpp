@@ -91,6 +91,21 @@ void QAmqpChannelPrivate::sendFrame(const QAmqpFrame &frame)
     client->d_func()->sendFrame(frame);
 }
 
+bool QAmqpChannelPrivate::sendFrameBatch(const QByteArray &data, qint64 reservedBytes)
+{
+    if (!client) {
+        qAmqpDebug() << Q_FUNC_INFO << "invalid client";
+        return false;
+    }
+
+    return client->d_func()->sendFrameBatch(data, reservedBytes);
+}
+
+bool QAmqpChannelPrivate::reserveWriteBytes(qint64 bytes)
+{
+    return client && client->d_func()->reserveWriteBytes(bytes);
+}
+
 void QAmqpChannelPrivate::resetInternalState()
 {
     flowActive = true;
