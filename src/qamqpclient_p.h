@@ -46,6 +46,9 @@ public:
     bool parseConnectionString(const QString &uri);
     bool sendFrame(const QAmqpFrame &frame);
     bool sendFrameBatch(const QByteArray &data, qint64 reservedBytes = 0);
+    bool enqueueWrite(const QByteArray &data, qint64 reservedBytes, bool control, bool heartbeat);
+    bool canSendControl(int index) const;
+    void failControlWrite(const QString &reason);
     bool reserveWriteBytes(qint64 bytes);
     void releaseWriteBytes(qint64 bytes);
     void flushPendingWrites();
@@ -108,14 +111,27 @@ public:
     bool useSsl;
 
     QSslSocket *socket;
+    enum { ControlWriteQueueBytes = 64 * 1024 };
     struct PendingWrite {
         QByteArray data;
         qint64 offset;
+        qint64 frameEnd;
+        quint16 channel;
+        quint64 sequence;
+        bool heartbeat;
+    };
+    struct WriteSegment {
+        qint64 bytes;
+        bool control;
     };
     QQueue<PendingWrite> pendingWrites;
+    QQueue<PendingWrite> controlWrites;
+    QQueue<WriteSegment> inFlightWrites;
     qint64 bufferedWriteBytes;
     qint64 socketPendingBytes;
     qint64 maxWriteQueueBytes;
+    qint64 bufferedControlBytes;
+    quint64 nextWriteSequence;
     QSet<quint16> pendingChannelCloses;
     QHash<quint16, QList<QAmqpMethodFrameHandler*> > methodHandlersByChannel;
     QHash<quint16, QList<QAmqpContentFrameHandler*> > contentHandlerByChannel;
@@ -125,6 +141,7 @@ public:
     bool closed;
     bool connected;
     QPointer<QTimer> heartbeatTimer;
+    QPointer<QTimer> controlWriteTimer;
     QPointer<QTimer> reconnectTimer;
     QAmqpTable customProperties;
     quint16 channelMax;

@@ -29,6 +29,8 @@ QAmqpClientPrivate::QAmqpClientPrivate(QAmqpClient *q)
     bufferedWriteBytes(0),
     socketPendingBytes(0),
     maxWriteQueueBytes(16 * 1024 * 1024),
+    bufferedControlBytes(0),
+    nextWriteSequence(0),
       closed(false),
       connected(false),
       channelMax(0),
@@ -51,6 +53,11 @@ void QAmqpClientPrivate::init()
     initSocket();
     heartbeatTimer = new QTimer(q);
     QObject::connect(heartbeatTimer, SIGNAL(timeout()), q, SLOT(_q_heartbeat()));
+    controlWriteTimer = new QTimer(q);
+    controlWriteTimer->setSingleShot(true);
+    QObject::connect(controlWriteTimer, &QTimer::timeout, q, [this] {
+        failControlWrite("AMQP control write timed out");
+    });
     reconnectTimer = new QTimer(q);
     reconnectTimer->setSingleShot(true);
     QObject::connect(reconnectTimer, SIGNAL(timeout()), q, SLOT(_q_connect()));
@@ -308,7 +315,7 @@ void QAmqpClientPrivate::_q_socketConnected()
     if(reconnectFixedTimeout == false)
         timeout = 0;
     char header[8] = {'A', 'M', 'Q', 'P', 0, 0, 9, 1};
-    socket->write(header, 8);
+    enqueueWrite(QByteArray(header, 8), 0, true, false);
 }
 
 void QAmqpClientPrivate::_q_socketDisconnected()
@@ -318,6 +325,11 @@ void QAmqpClientPrivate::_q_socketDisconnected()
     buffer.clear();
     const qint64 discardedBytes = socketPendingBytes;
     pendingWrites.clear();
+    controlWrites.clear();
+    inFlightWrites.clear();
+    bufferedControlBytes = 0;
+    if (controlWriteTimer)
+        controlWriteTimer->stop();
     socketPendingBytes = 0;
     releaseWriteBytes(discardedBytes);
     if (discardedBytes > 0)
@@ -534,7 +546,7 @@ bool QAmqpClientPrivate::sendFrame(const QAmqpFrame &frame)
         Q_EMIT q->error(error);
         return false;
     }
-    if (!sendFrameBatch(data))
+    if (!enqueueWrite(data, 0, true, frame.type() == QAmqpFrame::Heartbeat))
         return false;
     if (frame.type() == QAmqpFrame::Method) {
         const QAmqpMethodFrame &method = static_cast<const QAmqpMethodFrame &>(frame);
@@ -547,33 +559,93 @@ bool QAmqpClientPrivate::sendFrame(const QAmqpFrame &frame)
 
 bool QAmqpClientPrivate::sendFrameBatch(const QByteArray &data, qint64 reservedBytes)
 {
+    return enqueueWrite(data, reservedBytes, false, false);
+}
+
+bool QAmqpClientPrivate::enqueueWrite(const QByteArray &data, qint64 reservedBytes,
+                                    bool control, bool heartbeat)
+{
     if (socket->state() != QAbstractSocket::ConnectedState) {
         qAmqpDebug() << Q_FUNC_INFO << "socket not connected: " << socket->state();
         return false;
     }
 
     const qint64 actualBytes = data.size();
-    if (reservedBytes < 0 || reservedBytes > bufferedWriteBytes)
+    if (!actualBytes)
         return false;
-    const qint64 extraBytes = qMax(qint64(0), actualBytes - reservedBytes);
-    if (extraBytes > 0 &&
-        !canReserveWriteBytes(bufferedWriteBytes, extraBytes, maxWriteQueueBytes)) {
-        Q_Q(QAmqpClient);
-        Q_EMIT q->writeQueueOverflow(actualBytes);
-        return false;
-    }
+    if (control) {
+        if (!canReserveWriteBytes(bufferedControlBytes, actualBytes, ControlWriteQueueBytes)) {
+            failControlWrite("AMQP control write reserve exhausted");
+            return false;
+        }
+        bufferedControlBytes += actualBytes;
+    } else {
+        if (reservedBytes < 0 || reservedBytes > bufferedWriteBytes)
+            return false;
+        const qint64 extraBytes = qMax(qint64(0), actualBytes - reservedBytes);
+        if (extraBytes > 0 &&
+            !canReserveWriteBytes(bufferedWriteBytes, extraBytes, maxWriteQueueBytes)) {
+            Q_Q(QAmqpClient);
+            Q_EMIT q->writeQueueOverflow(actualBytes);
+            return false;
+        }
 
-    bufferedWriteBytes += extraBytes;
-    if (reservedBytes > actualBytes)
-        releaseWriteBytes(reservedBytes - actualBytes);
+        bufferedWriteBytes += extraBytes;
+        if (reservedBytes > actualBytes)
+            releaseWriteBytes(reservedBytes - actualBytes);
+    }
 
     PendingWrite pending;
     pending.data = data;
     pending.offset = 0;
-    pendingWrites.enqueue(pending);
-    socketPendingBytes += actualBytes;
+    pending.frameEnd = 0;
+    pending.channel = data.size() >= QAmqpFrame::HEADER_SIZE
+                          ? qFromBigEndian<quint16>(reinterpret_cast<const uchar *>(data.constData() + 1))
+                          : 0;
+    pending.sequence = nextWriteSequence++;
+    pending.heartbeat = heartbeat;
+    if (control) {
+        controlWrites.enqueue(pending);
+        if (controlWriteTimer && !controlWriteTimer->isActive())
+            controlWriteTimer->start(heartbeatDelay ? qMin(30000, int(heartbeatDelay) * 1000) : 30000);
+    } else {
+        pendingWrites.enqueue(pending);
+        socketPendingBytes += actualBytes;
+    }
     flushPendingWrites();
+    return socket->state() == QAbstractSocket::ConnectedState;
+}
+
+bool QAmqpClientPrivate::canSendControl(int index) const
+{
+    const PendingWrite &control = controlWrites.at(index);
+    if (control.offset)
+        return true;
+    for (int earlier = 0; earlier < index; ++earlier) {
+        if (controlWrites.at(earlier).channel == control.channel)
+            return false;
+    }
+    if (control.heartbeat)
+        return true;
+    foreach (const PendingWrite &publish, pendingWrites) {
+        if (publish.sequence < control.sequence &&
+            (!control.channel || publish.channel == control.channel))
+            return false;
+    }
     return true;
+}
+
+void QAmqpClientPrivate::failControlWrite(const QString &reason)
+{
+    Q_Q(QAmqpClient);
+    error = QAMQP::ResourceError;
+    errorString = reason;
+    if (controlWriteTimer)
+        controlWriteTimer->stop();
+    socket->abort();
+    if (autoReconnect && reconnectTimer)
+        reconnectTimer->start(qMax(1000, timeout));
+    Q_EMIT q->error(error);
 }
 
 void QAmqpClientPrivate::flushPendingWrites()
@@ -582,30 +654,98 @@ void QAmqpClientPrivate::flushPendingWrites()
         return;
 
     const qint64 socketBufferLimit = 64 * 1024;
-    while (!pendingWrites.isEmpty()) {
+    while (!pendingWrites.isEmpty() || !controlWrites.isEmpty()) {
         const qint64 available = socketBufferLimit - socket->bytesToWrite();
         if (available <= 0)
             return;
 
-        PendingWrite &pending = pendingWrites.head();
-        const qint64 remaining = pending.data.size() - pending.offset;
+        int controlIndex = -1;
+        const bool partialApplicationFrame = !pendingWrites.isEmpty() &&
+            pendingWrites.head().offset < pendingWrites.head().frameEnd;
+        if (!partialApplicationFrame) {
+            for (int index = 0; index < controlWrites.size(); ++index) {
+                if (controlWrites.at(index).offset) {
+                    controlIndex = index;
+                    break;
+                }
+            }
+            if (controlIndex < 0) {
+                for (int index = 0; index < controlWrites.size(); ++index) {
+                    if (canSendControl(index)) {
+                        controlIndex = index;
+                        break;
+                    }
+                }
+            }
+        }
+        if (controlIndex < 0 && pendingWrites.isEmpty())
+            return;
+        PendingWrite &pending = controlIndex >= 0 ? controlWrites[controlIndex] : pendingWrites.head();
+        if (pending.frameEnd == pending.offset) {
+            pending.frameEnd = pending.data.size();
+            const qint64 remainingBytes = pending.data.size() - pending.offset;
+            if (remainingBytes >= QAmqpFrame::HEADER_SIZE) {
+                const uchar *header = reinterpret_cast<const uchar *>(pending.data.constData() + pending.offset);
+                const qint64 frameBytes = QAmqpFrame::HEADER_SIZE +
+                    qFromBigEndian<quint32>(header + 3) + QAmqpFrame::FRAME_END_SIZE;
+                if ((header[0] == QAmqpFrame::Method || header[0] == QAmqpFrame::Header ||
+                     header[0] == QAmqpFrame::Body || header[0] == QAmqpFrame::Heartbeat) &&
+                    frameBytes <= remainingBytes)
+                    pending.frameEnd = pending.offset + frameBytes;
+            }
+        }
+        const qint64 remaining = pending.frameEnd - pending.offset;
         const qint64 chunkSize = qMin(available, remaining);
         const qint64 written = socket->write(pending.data.constData() + pending.offset,
                                               chunkSize);
-        if (written <= 0)
+        if (written < 0) {
+            failControlWrite("AMQP asynchronous socket write failed");
+            return;
+        }
+        if (!written)
             return;
 
+        const bool control = controlIndex >= 0;
+        if (!inFlightWrites.isEmpty() && inFlightWrites.back().control == control) {
+            inFlightWrites.back().bytes += written;
+        } else {
+            WriteSegment segment;
+            segment.bytes = written;
+            segment.control = control;
+            inFlightWrites.enqueue(segment);
+        }
         pending.offset += written;
-        if (pending.offset == pending.data.size())
-            pendingWrites.dequeue();
+        if (pending.offset == pending.data.size()) {
+            if (control)
+                controlWrites.removeAt(controlIndex);
+            else
+                pendingWrites.dequeue();
+        }
     }
 }
 
 void QAmqpClientPrivate::_q_bytesWritten(qint64 bytes)
 {
-    const qint64 completed = qMin(bytes, socketPendingBytes);
-    socketPendingBytes -= completed;
-    releaseWriteBytes(completed);
+    bool controlProgress = false;
+    while (bytes > 0 && !inFlightWrites.isEmpty()) {
+        WriteSegment &segment = inFlightWrites.head();
+        const qint64 completed = qMin(bytes, segment.bytes);
+        if (segment.control) {
+            bufferedControlBytes -= completed;
+            controlProgress = true;
+        } else {
+            socketPendingBytes -= completed;
+            releaseWriteBytes(completed);
+        }
+        segment.bytes -= completed;
+        bytes -= completed;
+        if (!segment.bytes)
+            inFlightWrites.dequeue();
+    }
+    if (!bufferedControlBytes && controlWriteTimer)
+        controlWriteTimer->stop();
+    else if (controlProgress && controlWriteTimer)
+        controlWriteTimer->start(heartbeatDelay ? qMin(30000, int(heartbeatDelay) * 1000) : 30000);
     flushPendingWrites();
     flushDeferredPublishes();
 }

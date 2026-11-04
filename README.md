@@ -122,6 +122,18 @@ budget is 16 MiB and can be changed with `QAmqpClient::setMaxWriteQueueBytes()`.
 Setting the client budget to zero disables writes. Exceeding either limit is
 reported to the caller instead of silently dropping a publish. Writes are
 drained asynchronously, so a slow peer does not block the Qt event loop.
+Protocol traffic has a separate, fixed 64 KiB reserve; it is not included in
+`bufferedWriteBytes()` or the application write budget. Both budgets include
+their corresponding bytes already handed to Qt but not yet reported written.
+One socket writer finishes partial frames before switching traffic. Heartbeats
+and eligible traffic on other channels may pass queued publishes at complete
+frame boundaries; same-channel methods retain their ordering behind an admitted
+publish's method/header/body sequence. FIFO is preserved for queued publishes.
+An exhausted control reserve, failed socket write, or pending control traffic
+without control-byte progress for 30 seconds (or the negotiated heartbeat
+timeout, if shorter) emits `error(ResourceError)` and aborts the connection.
+Automatic reconnect is scheduled when enabled. Control priority cannot make a
+stalled peer drain, and never introduces blocking writes or unbounded buffering.
 Short strings exceeding 255 UTF-8 bytes are rejected before admission, without
 truncation or a write reservation. Invalid publishes return `RejectedInvalid`
 and emit `publishRejected(InvalidShortString)` once.
