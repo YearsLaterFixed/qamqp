@@ -50,6 +50,23 @@ Run `tst_qamqpparser` and `tst_qamqpflow` without RabbitMQ. The other test
 executables require RabbitMQ on `localhost:5672`; `tst_qamqpclient` TLS tests
 also require a TLS listener on port 5671. The CI workflow shows the service
 configuration and the RabbitMQ control wrapper needed by reconnect tests.
+The reconnect cases are registered QtTest tests: one restarts the dedicated test
+broker and verifies retained named channels, rebind/reconsume, and delivery;
+another checks fixed-delay recovery from connection refusal. Run them only
+against a disposable broker controlled by the test `rabbitmqctl` wrapper.
+TLS tests require fresh fixtures instead of the legacy checked-in certificates:
+
+```bash
+bash tests/files/ci/generate-certificates.sh /tmp/qamqp-certificates
+export QAMQP_TEST_CA_CERT=/tmp/qamqp-certificates/testca/cacert.pem
+```
+
+Mount that directory at `/certs` in the test broker. The generated server
+certificate identifies `localhost` and `127.0.0.1`; tests explicitly verify the
+peer and reject untrusted certificates and hostname mismatches without ignoring
+SSL errors. Keys are ephemeral test fixtures, not production credentials. CI
+generates them for every run and checks that all restored test names are
+discoverable before executing the integration suites.
 
 Build and install with CMake (QAMQP 1.0.0 and later):
 
