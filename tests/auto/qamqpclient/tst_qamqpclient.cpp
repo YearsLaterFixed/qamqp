@@ -1,6 +1,10 @@
 #include <QtTest/QtTest>
 #include <QProcess>
-#include <QSslKey>
+#include <QSslSocket>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QTimer>
+#include <QUuid>
 
 #include "qamqptestcase.h"
 #include "qamqpauthenticator.h"
@@ -38,10 +42,11 @@ private Q_SLOTS:
     void issue38();
     void issue38_take2();
 
-public Q_SLOTS:     // temporarily disabled
     void autoReconnect();
     void autoReconnectTimeout();
     void sslConnect();
+    void sslRejectsUntrustedCertificate();
+    void sslRejectsWrongPeerName();
 
 private:
     QSslConfiguration createSslConfiguration();
@@ -49,22 +54,41 @@ private:
 
 };
 
+class ReconnectTestClient : public QAmqpClient
+{
+public:
+    QAmqpClientPrivate *state() { return d_func(); }
+};
+
+static bool runBrokerCommand(const QString &command)
+{
+    QProcess process;
+    process.start("rabbitmqctl", QStringList() << command);
+    if (!process.waitForStarted(5000))
+        return false;
+    if (!process.waitForFinished(30000)) {
+        process.kill();
+        process.waitForFinished(5000);
+        return false;
+    }
+    return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+}
+
+class BrokerRestartGuard
+{
+public:
+    BrokerRestartGuard() : stopped(false) {}
+    ~BrokerRestartGuard() { if (stopped) runBrokerCommand("start_app"); }
+    bool stopped;
+};
+
 QSslConfiguration tst_QAMQPClient::createSslConfiguration()
 {
-    QList<QSslCertificate> caCerts =
-        QSslCertificate::fromPath(QLatin1String(":/certs/ca-cert.pem"));
-    QList<QSslCertificate> localCerts =
-        QSslCertificate::fromPath(QLatin1String(":/certs/client-cert.pem"));
-    QFile keyFile( QLatin1String(":/certs/client-key.pem"));
-    keyFile.open(QIODevice::ReadOnly);
-    QSslKey key(&keyFile, QSsl::Rsa, QSsl::Pem,  QSsl::PrivateKey);
-    keyFile.close();
-
-    QSslConfiguration sslConfiguration;
-    sslConfiguration.setCaCertificates(caCerts);
-    sslConfiguration.setLocalCertificate(localCerts.first());
-    sslConfiguration.setPrivateKey(key);
-    sslConfiguration.setProtocol(QSsl::SecureProtocols);
+    QSslConfiguration sslConfiguration = QSslConfiguration::defaultConfiguration();
+    sslConfiguration.setCaCertificates(QSslCertificate::fromPath(
+        qEnvironmentVariable("QAMQP_TEST_CA_CERT")));
+    sslConfiguration.setPeerVerifyMode(QSslSocket::VerifyPeer);
+    sslConfiguration.setProtocol(QSsl::TlsV1_2OrLater);
     return sslConfiguration;
 }
 
@@ -93,11 +117,57 @@ void tst_QAMQPClient::sslConnect()
     client.setUsername("guest");
     client.setPassword("guest");
     client.setSslConfiguration(createSslConfiguration());
-    QObject::connect(&client, SIGNAL(sslErrors(QList<QSslError>)),
-                     &client, SLOT(ignoreSslErrors(QList<QSslError>)));
-
+    QVERIFY(QSslSocket::supportsSsl());
+    QVERIFY2(!client.sslConfiguration().caCertificates().isEmpty(),
+             "Set QAMQP_TEST_CA_CERT to the freshly generated test CA certificate");
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy errors(&client, &QAmqpClient::sslErrors);
     client.connectToHost();
-    QVERIFY(waitForSignal(&client, SIGNAL(connected())));
+    QTRY_COMPARE(connected.count(), 1);
+    QCOMPARE(errors.count(), 0);
+    QCOMPARE(client.port(), quint16(5671));
+    QVERIFY(!client.sslConfiguration().peerCertificate().isNull());
+    QCOMPARE(client.sslConfiguration().peerVerifyMode(), QSslSocket::VerifyPeer);
+    client.disconnectFromHost();
+    QTRY_VERIFY(!client.isConnected());
+}
+
+void tst_QAMQPClient::sslRejectsUntrustedCertificate()
+{
+    QAmqpClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
+    QSslConfiguration configuration = createSslConfiguration();
+    configuration.setCaCertificates(QList<QSslCertificate>());
+    client.setSslConfiguration(configuration);
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy errors(&client, &QAmqpClient::sslErrors);
+    client.connectToHost();
+    QTRY_VERIFY(!errors.isEmpty());
+    QTRY_COMPARE(client.socketState(), QAbstractSocket::UnconnectedState);
+    QCOMPARE(connected.count(), 0);
+    QVERIFY(!client.isConnected());
+}
+
+void tst_QAMQPClient::sslRejectsWrongPeerName()
+{
+    ReconnectTestClient client;
+    client.setUsername("guest");
+    client.setPassword("guest");
+    client.setSslConfiguration(createSslConfiguration());
+    QVERIFY(!client.sslConfiguration().caCertificates().isEmpty());
+    client.state()->socket->setPeerVerifyName("not-localhost.invalid");
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy errors(&client, &QAmqpClient::sslErrors);
+    client.connectToHost();
+    QTRY_VERIFY(!errors.isEmpty());
+    QTRY_COMPARE(client.socketState(), QAbstractSocket::UnconnectedState);
+    QCOMPARE(connected.count(), 0);
+    bool hostnameMismatch = false;
+    const QList<QSslError> failures = errors.first().at(0).value<QList<QSslError> >();
+    foreach (const QSslError &failure, failures)
+        hostnameMismatch = hostnameMismatch || failure.error() == QSslError::HostNameMismatch;
+    QVERIFY(hostnameMismatch);
 }
 
 void tst_QAMQPClient::connectProperties()
@@ -156,43 +226,108 @@ void tst_QAMQPClient::invalidAuthenticationMechanism()
 
 void tst_QAMQPClient::autoReconnect()
 {
-    // TODO: this is a fairly crude way of testing this, research
-    //       better alternatives
-
-    QAmqpClient client;
+    ReconnectTestClient client;
     client.setUsername("guest");
     client.setPassword("guest");
-    client.setAutoReconnect(true);
+    client.setAutoReconnect(true, 100);
+    const QString name = "reconnect-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QAmqpExchange *exchange = client.createExchange(name);
+    QAmqpQueue *queue = client.createQueue(name);
+    QVERIFY(exchange);
+    QVERIFY(queue);
+    const int exchangeChannel = exchange->channelNumber();
+    const int queueChannel = queue->channelNumber();
+    QObject::connect(&client, &QAmqpClient::connected, &client,
+                     [exchange] { exchange->declare(QAmqpExchange::Direct, QAmqpExchange::Durable); });
+    QObject::connect(exchange, &QAmqpExchange::declared, &client,
+                     [queue] { queue->declare(QAmqpQueue::Durable); });
+    QObject::connect(queue, &QAmqpQueue::declared, &client,
+                     [queue, exchange] { queue->bind(exchange, "route"); });
+    QObject::connect(queue, &QAmqpQueue::bound, &client,
+                     [queue] { queue->consume(QAmqpQueue::coNoAck); });
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy disconnected(&client, &QAmqpClient::disconnected);
+    QSignalSpy consuming(queue, &QAmqpQueue::consuming);
+    QSignalSpy received(queue, &QAmqpQueue::messageReceived);
     client.connectToHost();
-    QVERIFY(waitForSignal(&client, SIGNAL(connected())));
-    QProcess::execute("rabbitmqctl", QStringList() << "stop_app");
-    QVERIFY(waitForSignal(&client, SIGNAL(disconnected())));
-    QProcess::execute("rabbitmqctl", QStringList() << "start_app");
-    QVERIFY(waitForSignal(&client, SIGNAL(connected()), 2));
+    QTRY_COMPARE(consuming.count(), 1);
+    QCOMPARE(exchange->publish("before reconnect", "route"), QAmqpExchange::AcceptedForWrite);
+    QTRY_COMPARE(received.count(), 1);
+    QCOMPARE(queue->dequeue().payload(), QByteArray("before reconnect"));
+    BrokerRestartGuard restart;
+    restart.stopped = true;
+    QVERIFY2(runBrokerCommand("stop_app"), "rabbitmqctl stop_app must succeed");
+    QTRY_COMPARE(disconnected.count(), 1);
+    QVERIFY2(runBrokerCommand("start_app"), "rabbitmqctl start_app must succeed");
+    restart.stopped = false;
+    QTRY_COMPARE_WITH_TIMEOUT(consuming.count(), 2, 15000);
+    QCOMPARE(connected.count(), 2);
+    QCOMPARE(client.createExchange(name), exchange);
+    QCOMPARE(client.createQueue(name), queue);
+    QCOMPARE(exchange->channelNumber(), exchangeChannel);
+    QCOMPARE(queue->channelNumber(), queueChannel);
+    QVERIFY(queue->isConsuming());
+    QCOMPARE(exchange->publish("after reconnect", "route"), QAmqpExchange::AcceptedForWrite);
+    QTRY_COMPARE(received.count(), 2);
+    QCOMPARE(queue->dequeue().payload(), QByteArray("after reconnect"));
+    QCOMPARE(queue->bufferedMessageCount(), 0);
+    QVERIFY(!client.state()->reconnectTimer->isActive());
+    client.setAutoReconnect(false);
+    QSignalSpy queueRemoved(queue, &QAmqpQueue::removed);
+    queue->remove(QAmqpQueue::roForce);
+    QTRY_COMPARE(queueRemoved.count(), 1);
+    QSignalSpy exchangeRemoved(exchange, &QAmqpExchange::removed);
+    exchange->remove(QAmqpExchange::roForce);
+    QTRY_COMPARE(exchangeRemoved.count(), 1);
+    client.disconnectFromHost();
+    QTRY_COMPARE(disconnected.count(), 2);
 }
 
 void tst_QAMQPClient::autoReconnectTimeout()
 {
-    // TODO: this is a fairly crude way of testing this, research
-    //       better alternatives
-
-    QAmqpClient client;
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    const quint16 port = server.serverPort();
+    server.close();
+    ReconnectTestClient client;
+    client.setHost("127.0.0.1");
+    client.setPort(port);
     client.setUsername("guest");
     client.setPassword("guest");
-    client.setAutoReconnect(true, 3);
+    client.setAutoReconnect(true, 100);
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy errors(&client, &QAmqpClient::socketErrorOccurred);
     client.connectToHost();
-    QVERIFY(waitForSignal(&client, SIGNAL(connected()), 60));
-    qDebug() <<"connected" ;
-    QProcess::execute("rabbitmqctl", QStringList() << "stop_app");
-    QVERIFY(waitForSignal(&client, SIGNAL(disconnected()), 60));
-    qDebug() <<"disconnected" ;
-    QProcess::execute("rabbitmqctl", QStringList() << "start_app");
-    QVERIFY(waitForSignal(&client, SIGNAL(connected()), 60));
-    qDebug() <<"connected" ;
-
-    QVERIFY(waitForSignal(&client, SIGNAL(disconnected()), 60));
-    QProcess::execute("rabbitmqctl", QStringList() << "start_app");
-    QVERIFY(waitForSignal(&client, SIGNAL(connected()), 60));
+    QTRY_VERIFY(errors.count() >= 3);
+    QCOMPARE(client.state()->reconnectTimer->interval(), 100);
+    QVERIFY(server.listen(QHostAddress::LocalHost, port));
+    int connections = 0;
+    QObject::connect(&server, &QTcpServer::newConnection, &client, [&] {
+        QTcpSocket *peer = server.nextPendingConnection();
+        ++connections;
+        QAmqpMethodFrame tune(QAmqpFrame::Connection, QAmqpClientPrivate::miTune);
+        QByteArray arguments;
+        QDataStream stream(&arguments, QIODevice::WriteOnly);
+        stream << quint16(16) << quint32(4096) << quint16(0);
+        tune.setArguments(arguments);
+        QAmqpMethodFrame open(QAmqpFrame::Connection, QAmqpClientPrivate::miOpenOk);
+        open.setArguments(QByteArray(1, char(0)));
+        QByteArray wire;
+        QDataStream output(&wire, QIODevice::WriteOnly);
+        output << tune << open;
+        peer->write(wire);
+        peer->flush();
+    });
+    QTRY_COMPARE(connected.count(), 1);
+    QVERIFY(client.isConnected());
+    QVERIFY(!client.state()->reconnectTimer->isActive());
+    bool observedStableConnection = false;
+    QTimer::singleShot(400, &client, [&observedStableConnection] { observedStableConnection = true; });
+    QTRY_VERIFY(observedStableConnection);
+    QCOMPARE(connections, 1);
+    QCOMPARE(connected.count(), 1);
+    client.setAutoReconnect(false);
+    client.abort();
 }
 
 void tst_QAMQPClient::tune()

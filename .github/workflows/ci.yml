@@ -72,17 +72,20 @@ jobs:
           cache: true
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential
+        run: sudo apt-get update && sudo apt-get install -y build-essential openssl
 
       - name: Start RabbitMQ with TLS fixtures
         shell: bash
         run: |
           set -euo pipefail
+          certificate_dir="$RUNNER_TEMP/qamqp-certificates"
+          bash tests/files/ci/generate-certificates.sh "$certificate_dir"
+          echo "QAMQP_TEST_CA_CERT=$certificate_dir/testca/cacert.pem" >> "$GITHUB_ENV"
           docker run --detach --name qamqp-rabbitmq \
             --hostname qamqp-rabbitmq \
             --publish 5672:5672 --publish 5671:5671 \
             --mount "type=bind,src=$GITHUB_WORKSPACE/tests/files/ci/rabbitmq.conf,dst=/etc/rabbitmq/rabbitmq.conf,readonly" \
-            --mount "type=bind,src=$GITHUB_WORKSPACE/tests/files/certs,dst=/certs,readonly" \
+            --mount "type=bind,src=$certificate_dir,dst=/certs,readonly" \
             --health-cmd 'rabbitmq-diagnostics -q ping' \
             --health-interval 2s --health-timeout 5s --health-retries 60 \
             rabbitmq:3.13-management
@@ -119,6 +122,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          tests/auto/qamqpclient/tst_qamqpclient -functions > "$RUNNER_TEMP/client-test-functions.txt"
+          for test in autoReconnect autoReconnectTimeout sslConnect sslRejectsUntrustedCertificate sslRejectsWrongPeerName; do
+            grep -Fx "$test()" "$RUNNER_TEMP/client-test-functions.txt"
+          done
           for test in qamqpclient qamqpexchange qamqpqueue qamqpchannel; do
             test_dir="tests/auto/$test"
             executable="$(sed -n 's/^TARGET[[:space:]]*=[[:space:]]*//p' "$test_dir/$test.pro" | head -n 1 | tr -d '[:space:]')"
