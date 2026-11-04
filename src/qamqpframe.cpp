@@ -418,10 +418,17 @@ void QAmqpContentFrame::writePayload(QDataStream &out) const
 void QAmqpContentFrame::readPayload(QDataStream &in)
 {
     in >> methodClass_;
-    in.skipRawData(2); //weight
+    qint16 weight = 0;
+    in >> weight;
     in >> bodySize_;
-    qint16 flags_ = 0;
+    quint16 flags_ = 0;
     in >> flags_;
+    if (in.status() != QDataStream::Ok || weight != 0 || bodySize_ < 0 ||
+        (flags_ & quint16(0x0003)) != 0) {
+        in.setStatus(QDataStream::ReadCorruptData);
+        return;
+    }
+
     if (flags_ & QAmqpMessage::ContentType)
         properties_[QAmqpMessage::ContentType] = readAmqpField(in, QAmqpMetaType::ShortString);
 

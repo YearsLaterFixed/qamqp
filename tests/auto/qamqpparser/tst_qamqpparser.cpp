@@ -2,6 +2,8 @@
 #include <QRandomGenerator>
 
 #include "qamqpframe_p.h"
+#include "qamqpclient_p.h"
+#include "qamqpclient.h"
 #include "qamqpqueue.h"
 #include "qamqpqueue_p.h"
 #include "qamqptable.h"
@@ -25,6 +27,7 @@ private Q_SLOTS:
     void utf8StringRoundTrip();
 
     void truncatedMethodFrame();
+    void decodedFrameValidation();
     void deeplyNestedArray();
 
     void messageBodySize_data();
@@ -32,6 +35,11 @@ private Q_SLOTS:
 
     void messageBodyChunk_data();
     void messageBodyChunk();
+    void queueBufferLimits_data();
+    void queueBufferLimits();
+    void queueBufferLimitConfiguration();
+    void queueBufferAccountingAndOverflow();
+    void queueProtocolBodyCapEmitsDiscard();
 
     void fuzzReadAmqpField();
     void fuzzTableFieldValues();
@@ -171,6 +179,61 @@ void tst_QAMQPParser::truncatedMethodFrame()
     }
 }
 
+void tst_QAMQPParser::decodedFrameValidation()
+{
+    QByteArray validMethodBytes;
+    QAmqpMethodFrame validMethod(QAmqpFrame::Basic, 10);
+    validMethod.setChannel(1);
+    QDataStream validMethodOut(&validMethodBytes, QIODevice::WriteOnly);
+    validMethodOut << validMethod;
+    QDataStream validMethodIn(validMethodBytes);
+    QAmqpMethodFrame decodedMethod;
+    validMethodIn >> decodedMethod;
+    QVERIFY(QAmqpClientPrivate::validateDecodedFrame(decodedMethod, validMethodIn.status(), 4));
+
+    QByteArray truncatedMethodBytes;
+    QDataStream truncatedMethodOut(&truncatedMethodBytes, QIODevice::WriteOnly);
+    truncatedMethodOut << qint8(QAmqpFrame::Method) << quint16(1) << qint32(3)
+                       << qint16(QAmqpFrame::Basic) << qint8(0) << qint8(10)
+                       << qint8(QAmqpFrame::FRAME_END);
+    QDataStream truncatedMethodIn(truncatedMethodBytes);
+    QAmqpMethodFrame truncatedMethod;
+    truncatedMethodIn >> truncatedMethod;
+    QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(truncatedMethod,
+                                                       truncatedMethodIn.status(), 3));
+
+    QByteArray validHeartbeatBytes;
+    QAmqpHeartbeatFrame validHeartbeat;
+    QDataStream validHeartbeatOut(&validHeartbeatBytes, QIODevice::WriteOnly);
+    validHeartbeatOut << validHeartbeat;
+    QDataStream validHeartbeatIn(validHeartbeatBytes);
+    QAmqpHeartbeatFrame decodedHeartbeat;
+    validHeartbeatIn >> decodedHeartbeat;
+    QVERIFY(QAmqpClientPrivate::validateDecodedFrame(decodedHeartbeat,
+                                                       validHeartbeatIn.status(), 0));
+
+    QByteArray malformedHeartbeatBytes;
+    QDataStream malformedHeartbeatOut(&malformedHeartbeatBytes, QIODevice::WriteOnly);
+    malformedHeartbeatOut << qint8(QAmqpFrame::Heartbeat) << quint16(0) << qint32(1)
+                          << qint8(0) << qint8(QAmqpFrame::FRAME_END);
+    QDataStream malformedHeartbeatIn(malformedHeartbeatBytes);
+    QAmqpHeartbeatFrame malformedHeartbeat;
+    malformedHeartbeatIn >> malformedHeartbeat;
+    QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(malformedHeartbeat,
+                                                       malformedHeartbeatIn.status(), 1));
+
+    QByteArray malformedContentBytes;
+    QDataStream malformedContentOut(&malformedContentBytes, QIODevice::WriteOnly);
+    malformedContentOut << qint8(QAmqpFrame::Header) << quint16(1) << qint32(14)
+                        << qint16(QAmqpFrame::Basic) << qint16(0) << qlonglong(0)
+                        << quint16(QAmqpMessage::ContentType) << qint8(QAmqpFrame::FRAME_END);
+    QDataStream malformedContentIn(malformedContentBytes);
+    QAmqpContentFrame malformedContent;
+    malformedContentIn >> malformedContent;
+    QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(malformedContent,
+                                                       malformedContentIn.status(), 14));
+}
+
 void tst_QAMQPParser::deeplyNestedArray()
 {
     // nested "array containing an array containing an array ... containing Void";
@@ -243,6 +306,141 @@ void tst_QAMQPParser::messageBodyChunk()
     QFETCH(bool, accepted);
 
     QCOMPARE(QAmqpQueuePrivate::isAcceptableBodyChunk(remainingSize, chunkSize), accepted);
+}
+
+void tst_QAMQPParser::queueBufferLimits_data()
+{
+    QTest::addColumn<int>("bufferedCount");
+    QTest::addColumn<qlonglong>("bufferedBytes");
+    QTest::addColumn<qlonglong>("incomingBytes");
+    QTest::addColumn<int>("maxMessages");
+    QTest::addColumn<qlonglong>("maxBytes");
+    QTest::addColumn<qlonglong>("maxMessageSize");
+    QTest::addColumn<int>("expected");
+
+    QTest::newRow("exact-limits") << 0 << qlonglong(4) << qlonglong(6) << 1
+                                   << qlonglong(10) << qlonglong(6) << int(QAmqpQueue::NoOverflow);
+    QTest::newRow("message-count") << 1 << qlonglong(0) << qlonglong(1) << 1
+                                    << qlonglong(0) << qlonglong(0)
+                                    << int(QAmqpQueue::BufferedMessageCountLimitExceeded);
+    QTest::newRow("aggregate-bytes") << 0 << qlonglong(6) << qlonglong(5) << 0
+                                      << qlonglong(10) << qlonglong(0)
+                                      << int(QAmqpQueue::BufferedByteLimitExceeded);
+    QTest::newRow("individual-message") << 0 << qlonglong(0) << qlonglong(11) << 0
+                                         << qlonglong(0) << qlonglong(10)
+                                         << int(QAmqpQueue::MessageSizeLimitExceeded);
+    QTest::newRow("zero-means-unlimited") << 100 << qlonglong(1000) << qlonglong(2000) << 0
+                                           << qlonglong(0) << qlonglong(0)
+                                           << int(QAmqpQueue::NoOverflow);
+}
+
+void tst_QAMQPParser::queueBufferLimits()
+{
+    QFETCH(int, bufferedCount);
+    QFETCH(qlonglong, bufferedBytes);
+    QFETCH(qlonglong, incomingBytes);
+    QFETCH(int, maxMessages);
+    QFETCH(qlonglong, maxBytes);
+    QFETCH(qlonglong, maxMessageSize);
+    QFETCH(int, expected);
+
+    QCOMPARE(int(QAmqpQueuePrivate::overflowReason(bufferedCount, bufferedBytes, incomingBytes,
+                                                  maxMessages, maxBytes, maxMessageSize)), expected);
+}
+
+void tst_QAMQPParser::queueBufferLimitConfiguration()
+{
+    QAmqpClient client;
+    QAmqpQueue *queue = client.createQueue("queue-buffer-limit-test");
+    QVERIFY(queue);
+    QCOMPARE(queue->maxBufferedMessages(), 0);
+    QCOMPARE(queue->maxBufferedBytes(), qlonglong(0));
+    QCOMPARE(queue->maxMessageSize(), qlonglong(AMQP_MESSAGE_MAX));
+
+    queue->setMaxBufferedMessages(4);
+    queue->setMaxBufferedBytes(4096);
+    queue->setMaxMessageSize(1024);
+    QCOMPARE(queue->maxBufferedMessages(), 4);
+    QCOMPARE(queue->maxBufferedBytes(), qlonglong(4096));
+    QCOMPARE(queue->maxMessageSize(), qlonglong(1024));
+}
+
+static void deliverMessage(QAmqpQueuePrivate &queue, qulonglong deliveryTag)
+{
+    QAmqpMethodFrame delivery(QAmqpFrame::Basic, QAmqpQueuePrivate::bmDeliver);
+    delivery.setChannel(queue.channelNumber);
+    QByteArray arguments;
+    QDataStream out(&arguments, QIODevice::WriteOnly);
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::ShortString, QString());
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::LongLongUint, deliveryTag);
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::Boolean, false);
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::ShortString, "exchange");
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::ShortString, "routing-key");
+    delivery.setArguments(arguments);
+    queue.deliver(delivery);
+}
+
+void tst_QAMQPParser::queueBufferAccountingAndOverflow()
+{
+    QAmqpClient client;
+    QAmqpQueue *publicQueue = client.createQueue("queue-buffer-overflow-test");
+    QVERIFY(publicQueue);
+    QSignalSpy discarded(publicQueue, &QAmqpQueue::messageDiscarded);
+
+    QAmqpQueuePrivate queue(publicQueue);
+    queue.channelNumber = 1;
+    queue.maxBufferedMessages = 1;
+    queue.maxBufferedBytes = 4;
+    queue.maxMessageSize = 4;
+
+    deliverMessage(queue, 1);
+    QAmqpContentFrame header(QAmqpFrame::Basic);
+    header.setChannel(queue.channelNumber);
+    header.setBodySize(4);
+    QAmqpContentBodyFrame body;
+    body.setChannel(queue.channelNumber);
+    body.setBody("data");
+    queue._q_content(header);
+    queue._q_body(body);
+
+    QCOMPARE(queue.messages.size(), 1);
+    QCOMPARE(queue.bufferedBytes, qlonglong(4));
+    deliverMessage(queue, 2);
+    queue._q_content(header);
+    QVERIFY(queue.discardingMessage);
+    queue._q_body(body);
+    QVERIFY(!queue.discardingMessage);
+    QVERIFY(!queue.currentMessage.isValid());
+    QCOMPARE(discarded.count(), 1);
+    QCOMPARE(discarded.at(0).at(0).toLongLong(), qlonglong(2));
+    QCOMPARE(discarded.at(0).at(1).value<QAmqpQueue::OverflowReason>(),
+             QAmqpQueue::BufferedMessageCountLimitExceeded);
+    QCOMPARE(queue.messages.size(), 1);
+    QCOMPARE(queue.bufferedBytes, qlonglong(4));
+    QCOMPARE(queue.dequeueMessage().payload(), QByteArray("data"));
+    QCOMPARE(queue.bufferedBytes, qlonglong(0));
+}
+
+void tst_QAMQPParser::queueProtocolBodyCapEmitsDiscard()
+{
+    QAmqpClient client;
+    QAmqpQueue *publicQueue = client.createQueue("queue-protocol-body-limit-test");
+    QVERIFY(publicQueue);
+    QSignalSpy discarded(publicQueue, &QAmqpQueue::messageDiscarded);
+
+    QAmqpQueuePrivate queue(publicQueue);
+    queue.channelNumber = 1;
+    deliverMessage(queue, 17);
+    QAmqpContentFrame header(QAmqpFrame::Basic);
+    header.setChannel(queue.channelNumber);
+    header.setBodySize(qlonglong(AMQP_MESSAGE_MAX) + 1);
+    queue._q_content(header);
+
+    QCOMPARE(discarded.count(), 1);
+    QCOMPARE(discarded.at(0).at(0).toLongLong(), qlonglong(17));
+    QCOMPARE(discarded.at(0).at(1).value<QAmqpQueue::OverflowReason>(),
+             QAmqpQueue::MessageSizeLimitExceeded);
+    QVERIFY(!queue.currentMessage.isValid());
 }
 
 void tst_QAMQPParser::fuzzReadAmqpField()
