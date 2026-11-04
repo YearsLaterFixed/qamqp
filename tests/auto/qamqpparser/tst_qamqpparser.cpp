@@ -2,6 +2,7 @@
 #include <QRandomGenerator>
 
 #include "qamqpframe_p.h"
+#include "qamqpclient_p.h"
 #include "qamqpqueue.h"
 #include "qamqpqueue_p.h"
 #include "qamqptable.h"
@@ -25,6 +26,7 @@ private Q_SLOTS:
     void utf8StringRoundTrip();
 
     void truncatedMethodFrame();
+    void decodedFrameValidation();
     void deeplyNestedArray();
 
     void messageBodySize_data();
@@ -169,6 +171,61 @@ void tst_QAMQPParser::truncatedMethodFrame()
         in >> frame; // must not crash
         QVERIFY(frame.arguments().isEmpty());
     }
+}
+
+void tst_QAMQPParser::decodedFrameValidation()
+{
+    QByteArray validMethodBytes;
+    QAmqpMethodFrame validMethod(QAmqpFrame::Basic, 10);
+    validMethod.setChannel(1);
+    QDataStream validMethodOut(&validMethodBytes, QIODevice::WriteOnly);
+    validMethodOut << validMethod;
+    QDataStream validMethodIn(validMethodBytes);
+    QAmqpMethodFrame decodedMethod;
+    validMethodIn >> decodedMethod;
+    QVERIFY(QAmqpClientPrivate::validateDecodedFrame(decodedMethod, validMethodIn.status(), 4));
+
+    QByteArray truncatedMethodBytes;
+    QDataStream truncatedMethodOut(&truncatedMethodBytes, QIODevice::WriteOnly);
+    truncatedMethodOut << qint8(QAmqpFrame::Method) << quint16(1) << qint32(3)
+                       << qint16(QAmqpFrame::Basic) << qint8(0) << qint8(10)
+                       << qint8(QAmqpFrame::FRAME_END);
+    QDataStream truncatedMethodIn(truncatedMethodBytes);
+    QAmqpMethodFrame truncatedMethod;
+    truncatedMethodIn >> truncatedMethod;
+    QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(truncatedMethod,
+                                                       truncatedMethodIn.status(), 3));
+
+    QByteArray validHeartbeatBytes;
+    QAmqpHeartbeatFrame validHeartbeat;
+    QDataStream validHeartbeatOut(&validHeartbeatBytes, QIODevice::WriteOnly);
+    validHeartbeatOut << validHeartbeat;
+    QDataStream validHeartbeatIn(validHeartbeatBytes);
+    QAmqpHeartbeatFrame decodedHeartbeat;
+    validHeartbeatIn >> decodedHeartbeat;
+    QVERIFY(QAmqpClientPrivate::validateDecodedFrame(decodedHeartbeat,
+                                                       validHeartbeatIn.status(), 0));
+
+    QByteArray malformedHeartbeatBytes;
+    QDataStream malformedHeartbeatOut(&malformedHeartbeatBytes, QIODevice::WriteOnly);
+    malformedHeartbeatOut << qint8(QAmqpFrame::Heartbeat) << quint16(0) << qint32(1)
+                          << qint8(0) << qint8(QAmqpFrame::FRAME_END);
+    QDataStream malformedHeartbeatIn(malformedHeartbeatBytes);
+    QAmqpHeartbeatFrame malformedHeartbeat;
+    malformedHeartbeatIn >> malformedHeartbeat;
+    QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(malformedHeartbeat,
+                                                       malformedHeartbeatIn.status(), 1));
+
+    QByteArray malformedContentBytes;
+    QDataStream malformedContentOut(&malformedContentBytes, QIODevice::WriteOnly);
+    malformedContentOut << qint8(QAmqpFrame::Header) << quint16(1) << qint32(14)
+                        << qint16(QAmqpFrame::Basic) << qint16(0) << qlonglong(0)
+                        << quint16(QAmqpMessage::ContentType) << qint8(QAmqpFrame::FRAME_END);
+    QDataStream malformedContentIn(malformedContentBytes);
+    QAmqpContentFrame malformedContent;
+    malformedContentIn >> malformedContent;
+    QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(malformedContent,
+                                                       malformedContentIn.status(), 14));
 }
 
 void tst_QAMQPParser::deeplyNestedArray()

@@ -186,6 +186,49 @@ qint16 QAmqpClientPrivate::negotiateHeartbeat(qint16 clientHeartbeat, qint16 ser
     return qMin(clientHeartbeat, serverHeartbeat);
 }
 
+bool QAmqpClientPrivate::validateDecodedFrame(const QAmqpFrame &frame,
+                                               QDataStream::Status streamStatus,
+                                               qint64 wirePayloadSize)
+{
+    if (streamStatus != QDataStream::Ok || wirePayloadSize < 0 ||
+        wirePayloadSize > AMQP_FRAME_MAX)
+        return false;
+
+    switch (frame.type()) {
+    case QAmqpFrame::Method: {
+        const QAmqpMethodFrame &method = static_cast<const QAmqpMethodFrame &>(frame);
+        if (method.size() != wirePayloadSize || method.size() < 4)
+            return false;
+
+        switch (method.methodClass()) {
+        case QAmqpFrame::Connection:
+            return method.channel() == 0;
+        case QAmqpFrame::Channel:
+        case QAmqpFrame::Exchange:
+        case QAmqpFrame::Queue:
+        case QAmqpFrame::Basic:
+        case QAmqpFrame::Confirm:
+        case QAmqpFrame::Tx:
+            return method.channel() > 0;
+        }
+        return false;
+    }
+    case QAmqpFrame::Header: {
+        const QAmqpContentFrame &content = static_cast<const QAmqpContentFrame &>(frame);
+        return wirePayloadSize >= 14 && content.size() == wirePayloadSize &&
+               content.methodClass() == QAmqpFrame::Basic && content.channel() > 0;
+    }
+    case QAmqpFrame::Body: {
+        const QAmqpContentBodyFrame &body = static_cast<const QAmqpContentBodyFrame &>(frame);
+        return body.size() == wirePayloadSize && body.channel() > 0;
+    }
+    case QAmqpFrame::Heartbeat:
+        return wirePayloadSize == 0 && frame.channel() == 0;
+    }
+
+    return false;
+}
+
 bool QAmqpClientPrivate::parseConnectionString(const QString &uri)
 {
     QUrl connectionString = QUrl::fromUserInput(uri);
@@ -354,16 +397,21 @@ void QAmqpClientPrivate::_q_readyRead()
         {
             QAmqpMethodFrame frame;
             streamB >> frame;
-
-            if (Q_UNLIKELY(frame.size() > frameMax)) {
-                close(QAMQP::FrameError, "frame size too large");
+            if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                close(QAMQP::FrameError, "invalid method frame payload");
                 return;
             }
 
             if (frame.methodClass() == QAmqpFrame::Connection) {
                 _q_method(frame);
             } else {
-                foreach (QAmqpMethodFrameHandler *methodHandler, methodHandlersByChannel[frame.channel()])
+                const QList<QAmqpMethodFrameHandler *> handlers =
+                    methodHandlersByChannel.value(frame.channel());
+                if (handlers.isEmpty()) {
+                    close(QAMQP::ChannelError, "method frame references unknown channel");
+                    return;
+                }
+                foreach (QAmqpMethodFrameHandler *methodHandler, handlers)
                     methodHandler->_q_method(frame);
             }
         }
@@ -372,16 +420,18 @@ void QAmqpClientPrivate::_q_readyRead()
         {
             QAmqpContentFrame frame;
             streamB >> frame;
-
-            if (Q_UNLIKELY(frame.size() > frameMax)) {
-                close(QAMQP::FrameError, "frame size too large");
+            if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                close(QAMQP::FrameError, "invalid content header");
                 return;
-            } else if (Q_UNLIKELY(frame.channel() <= 0)) {
+            }
+            const QList<QAmqpContentFrameHandler *> handlers =
+                contentHandlerByChannel.value(frame.channel());
+            if (handlers.isEmpty()) {
                 close(QAMQP::ChannelError, "channel number must be greater than zero");
                 return;
             }
 
-            foreach (QAmqpContentFrameHandler *methodHandler, contentHandlerByChannel[frame.channel()])
+            foreach (QAmqpContentFrameHandler *methodHandler, handlers)
                 methodHandler->_q_content(frame);
         }
             break;
@@ -389,26 +439,27 @@ void QAmqpClientPrivate::_q_readyRead()
         {
             QAmqpContentBodyFrame frame;
             streamB >> frame;
-
-            if (Q_UNLIKELY(frame.size() > frameMax)) {
-                close(QAMQP::FrameError, "frame size too large");
+            if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                close(QAMQP::FrameError, "invalid content body");
                 return;
-            } else if (Q_UNLIKELY(frame.channel() <= 0)) {
+            }
+            const QList<QAmqpContentBodyFrameHandler *> handlers =
+                bodyHandlersByChannel.value(frame.channel());
+            if (handlers.isEmpty()) {
                 close(QAMQP::ChannelError, "channel number must be greater than zero");
                 return;
             }
 
-            foreach (QAmqpContentBodyFrameHandler *methodHandler, bodyHandlersByChannel[frame.channel()])
+            foreach (QAmqpContentBodyFrameHandler *methodHandler, handlers)
                 methodHandler->_q_body(frame);
         }
             break;
         case QAmqpFrame::Heartbeat:
         {
-            QAmqpMethodFrame frame;
+            QAmqpHeartbeatFrame frame;
             streamB >> frame;
-
-            if (Q_UNLIKELY(frame.channel() != 0)) {
-                close(QAMQP::FrameError, "heartbeat must have channel id zero");
+            if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                close(QAMQP::FrameError, "invalid heartbeat frame");
                 return;
             }
 
