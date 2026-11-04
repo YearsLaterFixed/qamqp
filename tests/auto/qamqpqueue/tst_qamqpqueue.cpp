@@ -1,6 +1,7 @@
 #include <float.h>
 
 #include <QScopedPointer>
+#include <QUuid>
 
 #include <QtTest/QtTest>
 #include "qamqptestcase.h"
@@ -50,6 +51,9 @@ private Q_SLOTS:
     void messageProperties();
     void emptyMessage();
     void cleanupOnDeletion();
+    void receiveOverflowRecovery_data();
+    void receiveOverflowRecovery();
+    void publishAdmissionIsNotBrokerConfirmation();
 
 private:
     QScopedPointer<QAmqpClient> client;
@@ -71,6 +75,197 @@ void tst_QAMQPQueue::cleanup()
         client->disconnectFromHost();
         QVERIFY(waitForSignal(client.data(), SIGNAL(disconnected())));
     }
+}
+
+void tst_QAMQPQueue::receiveOverflowRecovery_data()
+{
+    QTest::addColumn<bool>("noAck");
+    QTest::addColumn<int>("countLimit");
+    QTest::addColumn<qlonglong>("byteLimit");
+    QTest::addColumn<qlonglong>("bodyLimit");
+    QTest::addColumn<QByteArray>("firstPayload");
+    QTest::addColumn<QByteArray>("overflowPayload");
+    QTest::addColumn<QByteArray>("recoveryPayload");
+    QTest::addColumn<int>("reason");
+    for (int mode = 0; mode < 2; ++mode) {
+        const bool noAck = mode != 0;
+        const QByteArray prefix = noAck ? "no-ack-" : "ack-";
+        QTest::newRow((prefix + "empty-count").constData())
+            << noAck << 1 << qlonglong(0) << qlonglong(1024)
+            << QByteArray() << QByteArray() << QByteArray("recovery")
+            << int(QAmqpQueue::BufferedMessageCountLimitExceeded);
+        QTest::newRow((prefix + "multi-frame-count").constData())
+            << noAck << 1 << qlonglong(600000) << qlonglong(300000)
+            << QByteArray(200000, 'a') << QByteArray(200000, 'b') << QByteArray(200000, 'c')
+            << int(QAmqpQueue::BufferedMessageCountLimitExceeded);
+        QTest::newRow((prefix + "aggregate-bytes").constData())
+            << noAck << 0 << qlonglong(5) << qlonglong(10)
+            << QByteArray(4, 'a') << QByteArray(2, 'b') << QByteArray(5, 'c')
+            << int(QAmqpQueue::BufferedByteLimitExceeded);
+        QTest::newRow((prefix + "multi-frame-bytes").constData())
+            << noAck << 0 << qlonglong(300000) << qlonglong(300000)
+            << QByteArray(200000, 'a') << QByteArray(200000, 'b') << QByteArray(300000, 'c')
+            << int(QAmqpQueue::BufferedByteLimitExceeded);
+        QTest::newRow((prefix + "body-boundary").constData())
+            << noAck << 0 << qlonglong(20) << qlonglong(4)
+            << QByteArray(3, 'a') << QByteArray(5, 'b') << QByteArray(4, 'c')
+            << int(QAmqpQueue::MessageSizeLimitExceeded);
+        QTest::newRow((prefix + "multi-frame-body-boundary").constData())
+            << noAck << 0 << qlonglong(500000) << qlonglong(200001)
+            << QByteArray(200000, 'a') << QByteArray(200002, 'b') << QByteArray(200001, 'c')
+            << int(QAmqpQueue::MessageSizeLimitExceeded);
+    }
+}
+
+void tst_QAMQPQueue::receiveOverflowRecovery()
+{
+    QFETCH(bool, noAck);
+    QFETCH(int, countLimit);
+    QFETCH(qlonglong, byteLimit);
+    QFETCH(qlonglong, bodyLimit);
+    QFETCH(QByteArray, firstPayload);
+    QFETCH(QByteArray, overflowPayload);
+    QFETCH(QByteArray, recoveryPayload);
+    QFETCH(int, reason);
+    const QString name = "overflow-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QAmqpQueue *queue = client->createQueue(name);
+    QVERIFY(queue);
+    QSignalSpy declared(queue, &QAmqpQueue::declared);
+    QSignalSpy consuming(queue, &QAmqpQueue::consuming);
+    QSignalSpy received(queue, &QAmqpQueue::messageReceived);
+    QSignalSpy discarded(queue, &QAmqpQueue::messageDiscarded);
+    QSignalSpy cancelled(queue, &QAmqpQueue::cancelled);
+    QSignalSpy empty(queue, &QAmqpQueue::empty);
+    QSignalSpy connected(client.data(), &QAmqpClient::connected);
+    QSignalSpy disconnected(client.data(), &QAmqpClient::disconnected);
+    QSignalSpy errors(client.data(), SIGNAL(error(QAMQP::Error)));
+    queue->declare(QAmqpQueue::Durable);
+    QTRY_COMPARE(declared.count(), 1);
+    const int consumeOptions = noAck ? QAmqpQueue::coNoAck : QAmqpQueue::NoOptions;
+    QVERIFY(queue->consume(consumeOptions));
+    QTRY_COMPARE(consuming.count(), 1);
+    QAmqpExchange *exchange = client->createExchange();
+    QVERIFY(exchange);
+    int expectedReceived = 0;
+    int expectedDiscarded = 0;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        queue->setMaxBufferedMessages(countLimit);
+        queue->setMaxBufferedBytes(byteLimit);
+        queue->setMaxMessageSize(bodyLimit);
+        const QAmqpExchange::PublishResult firstResult = exchange->publish(firstPayload, name, "application/octet-stream");
+        QVERIFY(firstResult == QAmqpExchange::AcceptedForWrite || firstResult == QAmqpExchange::Queued);
+        const QAmqpExchange::PublishResult overflowResult = exchange->publish(overflowPayload, name, "application/octet-stream");
+        QVERIFY(overflowResult == QAmqpExchange::AcceptedForWrite || overflowResult == QAmqpExchange::Queued);
+        ++expectedReceived;
+        ++expectedDiscarded;
+        QTRY_COMPARE(received.count(), expectedReceived);
+        QTRY_COMPARE(discarded.count(), expectedDiscarded);
+        QTRY_COMPARE(queue->bufferedMessageCount(), 1);
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(firstPayload.size()));
+        QCOMPARE(discarded.last().at(1).value<QAmqpQueue::OverflowReason>(),
+                 static_cast<QAmqpQueue::OverflowReason>(reason));
+        const qlonglong deliveryTag = discarded.last().at(0).toLongLong();
+        QVERIFY(deliveryTag > 0);
+        const QAmqpMessage first = queue->dequeue();
+        QCOMPARE(first.payload(), firstPayload);
+        QVERIFY(!first.isRedelivered());
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(0));
+        if (!noAck) {
+            queue->ack(first);
+            queue->setMaxMessageSize(qMax(bodyLimit, qlonglong(overflowPayload.size())));
+            queue->reject(deliveryTag, true);
+            ++expectedReceived;
+            QTRY_COMPARE(received.count(), expectedReceived);
+            QTRY_COMPARE(queue->bufferedMessageCount(), 1);
+            const QAmqpMessage redelivered = queue->dequeue();
+            QCOMPARE(redelivered.payload(), overflowPayload);
+            QVERIFY(redelivered.isRedelivered());
+            queue->ack(redelivered);
+        } else {
+            const int cancelledBefore = cancelled.count();
+            QVERIFY(queue->cancel());
+            QTRY_COMPARE(cancelled.count(), cancelledBefore + 1);
+            const int emptyBefore = empty.count();
+            queue->get(true);
+            QTRY_COMPARE(empty.count(), emptyBefore + 1);
+            QCOMPARE(received.count(), expectedReceived);
+            const int consumingBefore = consuming.count();
+            QVERIFY(queue->consume(consumeOptions));
+            QTRY_COMPARE(consuming.count(), consumingBefore + 1);
+        }
+        queue->setMaxMessageSize(bodyLimit);
+        const QAmqpExchange::PublishResult recovery = exchange->publish(recoveryPayload, name, "application/octet-stream");
+        QVERIFY(recovery == QAmqpExchange::AcceptedForWrite || recovery == QAmqpExchange::Queued);
+        ++expectedReceived;
+        QTRY_COMPARE(received.count(), expectedReceived);
+        QTRY_COMPARE(queue->bufferedMessageCount(), 1);
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(recoveryPayload.size()));
+        const QAmqpMessage recovered = queue->dequeue();
+        QCOMPARE(recovered.payload(), recoveryPayload);
+        QVERIFY(!recovered.isRedelivered());
+        if (!noAck)
+            queue->ack(recovered);
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(0));
+        QCOMPARE(discarded.count(), expectedDiscarded);
+        if (cycle < 2) {
+            const int disconnectedBefore = disconnected.count();
+            client->disconnectFromHost();
+            QTRY_COMPARE(disconnected.count(), disconnectedBefore + 1);
+            QCOMPARE(queue->bufferedMessageCount(), 0);
+            const int declaredBefore = declared.count();
+            const int connectedBefore = connected.count();
+            queue->declare(QAmqpQueue::Durable);
+            client->connectToHost();
+            QTRY_COMPARE(connected.count(), connectedBefore + 1);
+            QTRY_COMPARE(declared.count(), declaredBefore + 1);
+            QCOMPARE(client->createQueue(name), queue);
+            const int consumingBefore = consuming.count();
+            QVERIFY(queue->consume(consumeOptions));
+            QTRY_COMPARE(consuming.count(), consumingBefore + 1);
+        }
+    }
+    QCOMPARE(errors.count(), 0);
+    QCOMPARE(discarded.count(), 3);
+    QSignalSpy removed(queue, &QAmqpQueue::removed);
+    queue->remove(QAmqpQueue::roForce);
+    QTRY_COMPARE(removed.count(), 1);
+}
+
+void tst_QAMQPQueue::publishAdmissionIsNotBrokerConfirmation()
+{
+    const QString name = "confirmation-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QAmqpQueue *queue = client->createQueue(name);
+    QVERIFY(queue);
+    queue->setMaxBufferedMessages(16);
+    queue->setMaxBufferedBytes(65536);
+    queue->setMaxMessageSize(4096);
+    declareQueueAndVerifyConsuming(queue);
+    QAmqpExchange *exchange = client->createExchange();
+    QVERIFY(exchange);
+    QSignalSpy confirmsEnabled(exchange, &QAmqpExchange::confirmsEnabled);
+    QSignalSpy confirmed(exchange, &QAmqpExchange::allMessagesDelivered);
+    QSignalSpy received(queue, &QAmqpQueue::messageReceived);
+    QSignalSpy discarded(queue, &QAmqpQueue::messageDiscarded);
+    exchange->enableConfirms();
+    QTRY_COMPARE(confirmsEnabled.count(), 1);
+    for (int cycle = 0; cycle < 16; ++cycle) {
+        for (int index = 0; index < 8; ++index) {
+            const QByteArray payload = QByteArray::number(cycle * 8 + index);
+            QCOMPARE(exchange->publish(payload, name, "text/plain"), QAmqpExchange::AcceptedForWrite);
+            QCOMPARE(confirmed.count(), cycle);
+        }
+        QTRY_COMPARE(confirmed.count(), cycle + 1);
+        QTRY_COMPARE(received.count(), (cycle + 1) * 8);
+        QCOMPARE(queue->bufferedMessageCount(), 8);
+        for (int index = 0; index < 8; ++index)
+            QCOMPARE(queue->dequeue().payload(), QByteArray::number(cycle * 8 + index));
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(0));
+        QCOMPARE(client->bufferedWriteBytes(), qlonglong(0));
+    }
+    QCOMPARE(discarded.count(), 0);
+    QSignalSpy removed(queue, &QAmqpQueue::removed);
+    queue->remove(QAmqpQueue::roForce);
+    QTRY_COMPARE(removed.count(), 1);
 }
 
 void tst_QAMQPQueue::defaultExchange()

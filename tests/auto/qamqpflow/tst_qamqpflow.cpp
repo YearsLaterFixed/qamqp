@@ -61,6 +61,8 @@ private Q_SLOTS:
     void zeroHeartbeatDisablesWatchdog();
     void disconnectStopsHeartbeatTimers();
     void heartbeatTimeoutReconnectsOnce();
+    void sustainedPublishPressure_data();
+    void sustainedPublishPressure();
     void clientDestructionWithDeferredPublishes();
     void writeQueueReservation();
     void asynchronousWriteQueue();
@@ -903,6 +905,188 @@ void tst_QAMQPFlow::heartbeatTimeoutReconnectsOnce()
     QVERIFY(!writer.receiveHeartbeatTimer->isActive());
     QVERIFY(!writer.lastReceived.isValid());
     QVERIFY(!writer.reconnectTimer->isActive());
+}
+
+void tst_QAMQPFlow::sustainedPublishPressure_data()
+{
+    QTest::addColumn<int>("deferredState");
+    QTest::newRow("channel-not-open") << 0;
+    QTest::newRow("flow-paused") << 1;
+    QTest::newRow("socket-disconnected") << 2;
+}
+
+void tst_QAMQPFlow::sustainedPublishPressure()
+{
+    QFETCH(int, deferredState);
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    writer.maxWriteQueueBytes = 64 * 1024;
+    writer.frameMax = 4096;
+    QAmqpExchange *exchange = client.createExchange("pressure-publish");
+    QAmqpExchangePrivate *exchangeState = dynamic_cast<QAmqpExchangePrivate *>(
+        writer.methodHandlersByChannel.value(exchange->channelNumber()).first());
+    QVERIFY(exchangeState);
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    QSignalSpy rejected(exchange, &QAmqpExchange::publishRejected);
+    QSignalSpy overflow(&client, &QAmqpClient::writeQueueOverflow);
+    QSignalSpy confirmed(exchange, &QAmqpExchange::allMessagesDelivered);
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    QAmqpTable metadata;
+    metadata.insert("metadata", QByteArray(2400, 'h'));
+    for (int cycle = 0; cycle < 32; ++cycle) {
+        if (deferredState == 2) {
+            peer->abort();
+            QTRY_COMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+            QVERIFY(!client.isConnected());
+        } else {
+            writer.connected = true;
+        }
+        exchangeState->opened = deferredState == 1;
+        exchangeState->flowActive = deferredState != 1;
+        QList<QByteArray> admitted;
+        qlonglong reservedBytes = 0;
+        bool limitReached = false;
+        for (int index = 0; index < 8; ++index) {
+            QByteArray payload(12000, char('a' + index));
+            payload.replace(0, 8, QByteArray::number(cycle * 100 + index).rightJustified(8, '0'));
+            const QAmqpExchange::PublishResult result =
+                exchange->publish(payload, "route", "application/octet-stream", metadata);
+            if (result == QAmqpExchange::RejectedLimit) {
+                limitReached = true;
+                QCOMPARE(client.bufferedWriteBytes(), reservedBytes);
+                break;
+            }
+            QCOMPARE(result, QAmqpExchange::Queued);
+            admitted.append(payload);
+            reservedBytes = client.bufferedWriteBytes();
+            QVERIFY(reservedBytes <= client.maxWriteQueueBytes());
+            QVERIFY(reservedBytes > qlonglong(admitted.size()) * payload.size());
+        }
+        QVERIFY(limitReached);
+        QCOMPARE(admitted.size(), 2);
+        QCOMPARE(exchangeState->pendingPublishes.size(), admitted.size());
+        QCOMPARE(writer.socketPendingBytes, qint64(0));
+        if (deferredState == 2) {
+            peer = connectControlWriter(client, server);
+            QVERIFY(peer);
+        }
+        writer.connected = true;
+        PartialWriteSocket *socket = static_cast<PartialWriteSocket *>(writer.socket);
+        socket->maximumWriteSize = 0;
+        exchangeState->opened = true;
+        exchangeState->flowActive = true;
+        exchangeState->flushPendingPublishes();
+        QVERIFY(exchangeState->pendingPublishes.isEmpty());
+        QCOMPARE(exchangeState->pendingPublishBytes, qint64(0));
+        QCOMPARE(writer.pendingWrites.size(), admitted.size());
+        QVERIFY(client.bufferedWriteBytes() < reservedBytes);
+        QVERIFY(client.bufferedWriteBytes() <= client.maxWriteQueueBytes());
+        const QAmqpMethodFrame sameChannel =
+            QAmqpChannelPrivate::flowOkFrame(quint16(exchange->channelNumber()), true);
+        const QAmqpMethodFrame otherChannel = QAmqpChannelPrivate::flowOkFrame(2, true);
+        QAmqpHeartbeatFrame heartbeat;
+        QVERIFY(writer.sendFrame(sameChannel));
+        QVERIFY(writer.sendFrame(otherChannel));
+        QVERIFY(writer.sendFrame(heartbeat));
+        const qint64 expectedBytes = writer.socketPendingBytes + writer.bufferedControlBytes;
+        const qlonglong blockedBytes = client.bufferedWriteBytes();
+        bool eventLoopServiced = false;
+        QTimer::singleShot(1, &client, [&eventLoopServiced] { eventLoopServiced = true; });
+        QTRY_VERIFY(eventLoopServiced);
+        QCOMPARE(peer->bytesAvailable(), qint64(0));
+        QCOMPARE(client.bufferedWriteBytes(), blockedBytes);
+        socket->maximumWriteSize = 127;
+        writer.flushPendingWrites();
+        QTRY_COMPARE(peer->bytesAvailable(), expectedBytes);
+        QTRY_COMPARE(client.bufferedWriteBytes(), qlonglong(0));
+        QTRY_COMPARE(writer.bufferedControlBytes, qint64(0));
+        QVERIFY(writer.pendingWrites.isEmpty());
+        QVERIFY(writer.controlWrites.isEmpty());
+        QVERIFY(writer.inFlightWrites.isEmpty());
+        const QByteArray wire = peer->readAll();
+        QDataStream input(wire);
+        QList<QByteArray> delivered;
+        QByteArray payload;
+        qulonglong remaining = 0;
+        int heartbeatCount = 0;
+        int otherControls = 0;
+        int sameControls = 0;
+        int publishes = 0;
+        while (!input.atEnd()) {
+            const qint64 frameStart = input.device()->pos();
+            quint8 type = 0;
+            quint16 channel = 0;
+            quint32 size = 0;
+            input >> type >> channel >> size;
+            QVERIFY(size + 8 <= 4096);
+            QByteArray framePayload(int(size), char(0));
+            QCOMPARE(input.readRawData(framePayload.data(), framePayload.size()), framePayload.size());
+            quint8 end = 0;
+            input >> end;
+            QCOMPARE(end, quint8(QAmqpFrame::FRAME_END));
+            if (type == QAmqpFrame::Heartbeat) {
+                QCOMPARE(channel, quint16(0));
+                QCOMPARE(size, quint32(0));
+                ++heartbeatCount;
+            } else if (type == QAmqpFrame::Method) {
+                QDataStream methodStream(framePayload);
+                quint16 methodClass = 0, methodId = 0;
+                methodStream >> methodClass >> methodId;
+                if (methodClass == QAmqpFrame::Basic) {
+                    QCOMPARE(methodId, quint16(QAmqpExchangePrivate::bmPublish));
+                    QCOMPARE(channel, quint16(exchange->channelNumber()));
+                    QCOMPARE(remaining, qulonglong(0));
+                    ++publishes;
+                } else {
+                    QCOMPARE(methodClass, quint16(QAmqpFrame::Channel));
+                    QCOMPARE(methodId, quint16(QAmqpChannelPrivate::miFlowOk));
+                    if (channel == exchange->channelNumber()) {
+                        QCOMPARE(remaining, qulonglong(0));
+                        QCOMPARE(delivered.size(), admitted.size());
+                        ++sameControls;
+                    } else {
+                        QCOMPARE(channel, quint16(2));
+                        ++otherControls;
+                    }
+                }
+            } else if (type == QAmqpFrame::Header) {
+                QCOMPARE(channel, quint16(exchange->channelNumber()));
+                QCOMPARE(remaining, qulonglong(0));
+                QDataStream headerStream(wire.mid(int(frameStart), int(size + 8)));
+                QAmqpContentFrame content;
+                headerStream >> content;
+                QCOMPARE(headerStream.status(), QDataStream::Ok);
+                QCOMPARE(content.property(QAmqpMessage::Headers).toHash().value("metadata").toByteArray(),
+                         QByteArray(2400, 'h'));
+                remaining = qulonglong(content.bodySize());
+                payload.clear();
+            } else {
+                QCOMPARE(type, quint8(QAmqpFrame::Body));
+                QCOMPARE(channel, quint16(exchange->channelNumber()));
+                QVERIFY(size <= remaining);
+                payload += framePayload;
+                remaining -= size;
+                if (!remaining)
+                    delivered.append(payload);
+            }
+        }
+        QCOMPARE(input.status(), QDataStream::Ok);
+        QCOMPARE(remaining, qulonglong(0));
+        QCOMPARE(publishes, admitted.size());
+        QCOMPARE(delivered, admitted);
+        QCOMPARE(heartbeatCount, 1);
+        QCOMPARE(otherControls, 1);
+        QCOMPARE(sameControls, 1);
+        QCOMPARE(confirmed.count(), 0);
+        QCOMPARE(rejected.count(), 0);
+        QCOMPARE(errors.count(), 0);
+    }
+    QCOMPARE(overflow.count(), 32);
 }
 
 void tst_QAMQPFlow::controlFramesRespectPublishSequence()

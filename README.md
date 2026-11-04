@@ -67,6 +67,16 @@ peer and reject untrusted certificates and hostname mismatches without ignoring
 SSL errors. Keys are ephemeral test fixtures, not production credentials. CI
 generates them for every run and checks that all restored test names are
 discoverable before executing the integration suites.
+Receive-overflow integration tests exercise acknowledged and `coNoAck` consumers
+through repeated count, payload-byte and body-size saturation/recovery cycles,
+including empty and multi-frame deliveries, explicit reject/requeue, and
+disconnect/reconsume. No-ack discard tests verify that no broker redelivery is
+available. Separate broker tests distinguish local publish admission from
+publisher confirmation and delivery. Controlled socket tests force stopped and
+partial writes through 32 recovery cycles per deferred state, checking
+metadata-inclusive accounting, per-exchange FIFO, frame integrity, control
+traffic and event-loop progress. These deterministic regressions supplement,
+but do not replace, longer-running release soak tests.
 
 Build and install with CMake (QAMQP 1.0.0 and later):
 
