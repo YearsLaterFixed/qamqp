@@ -53,6 +53,10 @@ void QAmqpClientPrivate::init()
     initSocket();
     heartbeatTimer = new QTimer(q);
     QObject::connect(heartbeatTimer, SIGNAL(timeout()), q, SLOT(_q_heartbeat()));
+    receiveHeartbeatTimer = new QTimer(q);
+    QObject::connect(receiveHeartbeatTimer, &QTimer::timeout, q, [this] {
+        _q_checkHeartbeat();
+    });
     controlWriteTimer = new QTimer(q);
     controlWriteTimer->setSingleShot(true);
     QObject::connect(controlWriteTimer, &QTimer::timeout, q, [this] {
@@ -449,6 +453,7 @@ void QAmqpClientPrivate::_q_connect()
 
 void QAmqpClientPrivate::_q_disconnect()
 {
+    stopHeartbeatTimers();
     if (reconnectTimer)
         reconnectTimer->stop();
     if (socket->state() == QAbstractSocket::UnconnectedState) {
@@ -463,6 +468,7 @@ void QAmqpClientPrivate::_q_disconnect()
 // private slots
 void QAmqpClientPrivate::_q_socketConnected()
 {
+    stopHeartbeatTimers();
     closed = false;
     if (reconnectTimer)
         reconnectTimer->stop();
@@ -474,6 +480,7 @@ void QAmqpClientPrivate::_q_socketConnected()
 
 void QAmqpClientPrivate::_q_socketDisconnected()
 {
+    stopHeartbeatTimers();
     pendingChannelCloses.clear();
     Q_Q(QAmqpClient);
     buffer.clear();
@@ -498,6 +505,38 @@ void QAmqpClientPrivate::_q_heartbeat()
 {
     QAmqpHeartbeatFrame frame;
     sendFrame(frame);
+}
+
+void QAmqpClientPrivate::stopHeartbeatTimers()
+{
+    if (heartbeatTimer)
+        heartbeatTimer->stop();
+    if (receiveHeartbeatTimer)
+        receiveHeartbeatTimer->stop();
+    lastReceived.invalidate();
+}
+
+void QAmqpClientPrivate::_q_checkHeartbeat()
+{
+    if (!heartbeatDelay || closed || socket->state() != QAbstractSocket::ConnectedState) {
+        stopHeartbeatTimers();
+        return;
+    }
+    if (!lastReceived.isValid())
+        return;
+    if (lastReceived.elapsed() < qint64(heartbeatDelay) * 1000)
+        return;
+    stopHeartbeatTimers();
+    Q_Q(QAmqpClient);
+    error = QAMQP::ConnectionForcedError;
+    errorString = "AMQP receive heartbeat timeout";
+    QPointer<QAmqpClient> guard(q);
+    socket->abort();
+    if (!guard)
+        return;
+    if (autoReconnect && reconnectTimer && !reconnectTimer->isActive())
+        reconnectTimer->start(timeout > 0 ? timeout : 1000);
+    Q_EMIT q->error(error);
 }
 
 void QAmqpClientPrivate::_q_socketError(QAbstractSocket::SocketError error)
@@ -545,6 +584,8 @@ void QAmqpClientPrivate::_q_socketError(QAbstractSocket::SocketError error)
 void QAmqpClientPrivate::_q_readyRead()
 {
     Q_Q(QAmqpClient);
+    if (lastReceived.isValid() && socket->bytesAvailable() > 0 && !closed)
+        lastReceived.restart();
     
     while (socket->bytesAvailable() >= QAmqpFrame::HEADER_SIZE) {
         unsigned char headerData[QAmqpFrame::HEADER_SIZE];
@@ -923,13 +964,12 @@ void QAmqpClientPrivate::flushDeferredPublishes()
 
 void QAmqpClientPrivate::closeConnection()
 {
+    stopHeartbeatTimers();
     qAmqpDebug("AMQP: closing connection");
 
     connected = false;
     if (reconnectTimer)
         reconnectTimer->stop();
-    if (heartbeatTimer)
-        heartbeatTimer->stop();
     socket->disconnectFromHost();
 }
 
@@ -1025,12 +1065,13 @@ void QAmqpClientPrivate::tune(const QAmqpMethodFrame &frame)
     qAmqpDebug("-> connection#tune( channel_max=%d, frame_max=%d, heartbeat=%d )",
                channelMax, frameMax, heartbeatDelay);
 
-    if (heartbeatTimer) {
-        heartbeatTimer->setInterval(heartbeatDelay * 1000);
-        if (heartbeatTimer->interval())
-            heartbeatTimer->start();
-        else
-            heartbeatTimer->stop();
+    stopHeartbeatTimers();
+    if (heartbeatDelay) {
+        lastReceived.start();
+        if (heartbeatTimer)
+            heartbeatTimer->start(int(heartbeatDelay) * 500);
+        if (receiveHeartbeatTimer)
+            receiveHeartbeatTimer->start(qMin(1000, qMax(100, int(heartbeatDelay) * 250)));
     }
 
     tuneOk();

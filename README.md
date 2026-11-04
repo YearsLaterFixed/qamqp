@@ -88,6 +88,19 @@ unlimited channels or disabled heartbeats, as defined by the protocol. Callers
 should handle the setter's range contract and update code that stored these
 properties as `qint16` to use at least `qint32`.
 
+#### heartbeat liveness
+After heartbeat negotiation, the client sends heartbeats every half timeout
+and monitors inbound activity with a monotonic clock. Ordinary inbound traffic
+counts as activity; peers do not need to send heartbeat frames while other
+traffic is arriving. A negotiated zero disables both heartbeat timers.
+If no inbound activity arrives within the negotiated timeout, the client aborts
+the socket and emits `error(ConnectionForcedError)` with a receive-heartbeat
+timeout description. Automatic reconnect schedules one pending attempt when
+enabled, using the configured reconnect delay (or a one-second fallback).
+Expiry checks run at most one second apart on the owning event loop. Closing,
+disconnecting, and starting a new connection stop the old timers and invalidate
+the old activity timestamp; a new negotiation starts a fresh deadline.
+
 #### thread affinity
 A `QAmqpClient`, and every channel, exchange and queue it creates, must be used
 from the thread that owns the client's event loop. Most of the API is invoked
