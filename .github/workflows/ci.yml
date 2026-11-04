@@ -1,0 +1,133 @@
+name: QAMQP CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+jobs:
+  broker-independent:
+    name: Parser and flow tests (Qt ${{ matrix.qt }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        qt: ["5.15.2", "6.5.3"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ matrix.qt }}
+          host: linux
+          target: desktop
+          cache: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Build QAMQP with warnings enabled
+        working-directory: src
+        run: |
+          qmake src.pro
+          make -j2
+
+      - name: Run broker-independent tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in qamqpparser qamqpflow; do
+            test_dir="tests/auto/$test"
+            (
+              cd "$test_dir"
+              qmake "$test.pro"
+              make -j2
+              executable="$(sed -n 's/^TARGET[[:space:]]*=[[:space:]]*//p' "$test.pro" | head -n 1)"
+              "./$executable"
+            )
+          done
+          client_dir=tests/auto/qamqpclient
+          (cd "$client_dir" && qmake qamqpclient.pro && make -j2)
+          for test in channelMaxNegotiation heartbeatNegotiation; do
+            (cd "$client_dir" && ./tst_qamqpclient "$test")
+          done
+
+  rabbitmq-integration:
+    name: RabbitMQ integration (Qt 5.15.2)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: "5.15.2"
+          host: linux
+          target: desktop
+          cache: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      - name: Start RabbitMQ with TLS fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name qamqp-rabbitmq \
+            --hostname qamqp-rabbitmq \
+            --publish 5672:5672 --publish 5671:5671 \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/tests/files/ci/rabbitmq.conf,dst=/etc/rabbitmq/rabbitmq.conf,readonly" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/tests/files/certs,dst=/certs,readonly" \
+            --health-cmd 'rabbitmq-diagnostics -q ping' \
+            --health-interval 2s --health-timeout 5s --health-retries 60 \
+            rabbitmq:3.13-management
+          for attempt in {1..60}; do
+            state=$(docker inspect --format '{{.State.Health.Status}}' qamqp-rabbitmq)
+            if [ "$state" = healthy ]; then
+              break
+            fi
+            sleep 2
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' qamqp-rabbitmq)" = healthy
+          printf '#!/usr/bin/env bash\nexec docker exec --user rabbitmq qamqp-rabbitmq rabbitmqctl "$@"\n' \
+            > "$RUNNER_TEMP/rabbitmqctl"
+          chmod +x "$RUNNER_TEMP/rabbitmqctl"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build QAMQP and integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          qmake src.pro
+          make -j2
+          for test in qamqpclient qamqpexchange qamqpqueue qamqpchannel; do
+            test_dir="../tests/auto/$test"
+            (
+              cd "$test_dir"
+              qmake "$test.pro"
+              make -j2
+            )
+          done
+
+      - name: Run RabbitMQ integration suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in qamqpclient qamqpexchange qamqpqueue qamqpchannel; do
+            test_dir="tests/auto/$test"
+            executable=$(sed -n 's/^TARGET[[:space:]]*=[[:space:]]*//p' "$test_dir/$test.pro" | head -n 1)
+            (cd "$test_dir" && timeout 25m "./$executable")
+          done
+
+      - name: RabbitMQ diagnostics on failure
+        if: failure()
+        run: docker logs qamqp-rabbitmq
+      - name: Stop RabbitMQ
+        if: always()
+        run: docker rm -f qamqp-rabbitmq || true
