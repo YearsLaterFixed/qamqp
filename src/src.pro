@@ -1,3 +1,6 @@
+# Fork modifications Copyright (C) 2026 Fabian Suhr (YearsLaterFixed).
+# Modified: 2026-11-04. See LICENSING.md for inherited rights and notices.
+# Fork/Contact: https://github.com/YearsLaterFixed/qamqp
 include(../qamqp.pri)
 
 INCLUDEPATH += .
@@ -10,6 +13,7 @@ QT += core network
 QT -= gui
 DEFINES += QAMQP_BUILD
 CONFIG += $${QAMQP_LIBRARY_TYPE}
+CONFIG += nostrip
 VERSION = $${QAMQP_VERSION}
 win32:DESTDIR = $$OUT_PWD
 macx:QMAKE_LFLAGS_SONAME = -Wl,-install_name,@rpath/
@@ -34,12 +38,12 @@ greaterThan(NEED_GCOV_SUPPORT, 0) {
     }
 }
 
-#Define GIT Macros
-GIT_VERSION = $$system(git describe --long --dirty --tags)
+GIT_VERSION = $${QAMQP_VERSION}
+exists($$PWD/../.git) {
+    GIT_DESCRIPTION = $$system(git -C $$shell_quote($$PWD/..) describe --always --dirty --tags)
+    !isEmpty(GIT_DESCRIPTION): GIT_VERSION = $$GIT_DESCRIPTION
+}
 DEFINES += GIT_VERSION=\\\"$$GIT_VERSION\\\"
-
-GIT_TAG = $$system(git describe --abbrev=0)
-VERSION = $$replace(GIT_TAG, v,)
 
 PRIVATE_HEADERS += \
     qamqpchannel_p.h \
@@ -64,11 +68,23 @@ HEADERS += \
     $${INSTALL_HEADERS} \
     $${PRIVATE_HEADERS}
 
-SOURCES += $$files($$PWD/*.cpp)
+SOURCES += \
+    qamqpauthenticator.cpp \
+    qamqpchannel.cpp \
+    qamqpchannelhash.cpp \
+    qamqpclient.cpp \
+    qamqpexchange.cpp \
+    qamqpframe.cpp \
+    qamqpmessage.cpp \
+    qamqpqueue.cpp \
+    qamqptable.cpp
 
 DISTFILES += \
-    ../.travis.yml \
     ../LICENSE \
+    ../COPYING.LESSER \
+    ../LICENSING.md \
+    ../LICENSES/MIT-historical.txt \
+    ../CHANGELOG.md \
     ../README.md
 
 # install
@@ -76,6 +92,14 @@ headers.files = $${INSTALL_HEADERS}
 headers.path = $${PREFIX}/include/qamqp
 target.path = $${PREFIX}/$${LIBDIR}
 INSTALLS += headers target
+license_docs.files = ../LICENSE ../COPYING.LESSER ../LICENSING.md ../CHANGELOG.md ../README.md
+license_docs.path = $${PREFIX}/share/doc/QAMQP
+historical_license.files = ../LICENSES/MIT-historical.txt
+historical_license.path = $${PREFIX}/share/doc/QAMQP/LICENSES
+INSTALLS += license_docs historical_license
+release_docs.files = ../docs/RELEASE.md ../docs/VALIDATION.md
+release_docs.path = $${PREFIX}/share/doc/QAMQP/docs
+INSTALLS += release_docs
 
 # pkg-config support
 CONFIG += create_pc create_prl no_install_prl

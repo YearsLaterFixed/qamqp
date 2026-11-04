@@ -1,4 +1,8 @@
 #include <QCoreApplication>
+/* Fork modifications Copyright (C) 2026 Fabian Suhr (YearsLaterFixed).
+ * Modified: 2026-11-04. Upstream: https://github.com/mbroadst/qamqp
+ * Fork/Contact: https://github.com/YearsLaterFixed/qamqp
+ * See LICENSING.md at repository root for inherited rights and notices. */
 #include <QDebug>
 #include <QDataStream>
 #include <QFile>

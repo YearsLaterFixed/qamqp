@@ -1,31 +1,22 @@
-[![Build Status](https://travis-ci.org/mbroadst/qamqp.svg?branch=master)](https://travis-ci.org/mbroadst/qamqp)
-[![Coverage Status](https://img.shields.io/coveralls/mbroadst/qamqp.svg)](https://coveralls.io/r/mbroadst/qamqp?branch=master)
+[![QAMQP CI](https://github.com/YearsLaterFixed/qamqp/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/YearsLaterFixed/qamqp/actions/workflows/ci.yml)
 
-QAMQP
-=============
-A Qt5/Qt6 implementation of AMQP 0.9.1, focusing primarily on RabbitMQ support.
+# QAMQP 1.0.0
 
-Usage
-------------
-* [hello world](https://github.com/mbroadst/qamqp/tree/master/tutorials/helloworld)
-* [pubsub](https://github.com/mbroadst/qamqp/tree/master/tutorials/pubsub)
-* [routing](https://github.com/mbroadst/qamqp/tree/master/tutorials/routing)
-* [rpc](https://github.com/mbroadst/qamqp/tree/master/tutorials/rpc)
-* [topics](https://github.com/mbroadst/qamqp/tree/master/tutorials/topics)
-* [work queues](https://github.com/mbroadst/qamqp/tree/master/tutorials/workqueues)
+An asynchronous Qt AMQP 0.9.1 client, maintained by
+[YearsLaterFixed](https://github.com/YearsLaterFixed/qamqp), derived from
+[mbroadst/qamqp](https://github.com/mbroadst/qamqp). RabbitMQ is the tested broker.
 
-Documentation
-------------
-Tests checked and integrated against rabbitmq 3.11 (August 1, 2022)
-Qt5.6.3 (MSVC2017) 32Bit
-Qt5.15.2 (MSVC2019, MSVC2022, MinGW, Clang) 32 and 64Bit
-Qt6.5 (MSVC2019, MSVC2022) 64Bit
+| Tested baseline | Coverage |
+| --- | --- |
+| Debian 11, Qt 5.15.2, GCC 10.2.1, C++11 | Full local broker/TLS/reconnect suite and source-package consumers |
+| Linux CI, Qt 5.15.2 and Qt 6.5.3 | Parser/flow, shared/static CMake packages and Git-free qmake builds |
+| RabbitMQ 3.13, Qt 5.15.2 | Delivery, confirms, overflow, reconnect, verified TLS and multi-channel soak |
+| Qt 5.15.2 with AddressSanitizer/UndefinedBehaviorSanitizer | Parser and controlled-socket lifecycle tests |
 
-A good starting point is:
-* running a local RabbitMQ,
-* browse to http://localhost:15672/#/queues  (guest/guest)
-* Start the "receive" sample and see in your browser the "hello" queue appear
-* publish a message there
+Qt 6 uses its own required language level. Historical upstream platform claims
+are not a fresh Windows/macOS certification. See [CHANGELOG.md](CHANGELOG.md)
+before migrating from ABI 0, and [LICENSING.md](LICENSING.md) before distribution.
+Examples are in [tutorials](tutorials).
 
 ## Testing
 
@@ -34,16 +25,20 @@ GitHub Actions runs the parser and channel-flow suites without a broker on Qt
 certificates and runs the client, exchange, queue, and channel integration
 suites, including reconnect tests.
 
-To build the library and all test targets locally with qmake:
+Build the library and all test targets out of tree with qmake:
 
 ```bash
-cd src
-qmake src.pro
+mkdir -p build-qmake
+cd build-qmake
+qmake ../src/src.pro
 make -j2
-cd ../tests/auto
+cd ..
 for test in qamqpparser qamqpflow qamqpclient qamqpexchange qamqpqueue qamqpchannel; do
-	(cd "$test" && qmake "$test.pro" && make -j2)
-done
+	mkdir -p "build-tests/$test"
+	(cd "build-tests/$test" && qmake "../../tests/auto/$test/$test.pro" \
+		"LIBS+=-L$PWD/../../build-qmake" && make -j2)
+	done
+	export LD_LIBRARY_PATH="$PWD/build-qmake${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
 Run `tst_qamqpparser` and `tst_qamqpflow` without RabbitMQ. The other test
@@ -90,6 +85,12 @@ Consumers can use `find_package(QAMQP CONFIG REQUIRED)` and link the exported
 `QAMQP::qamqp` target. Qt Core and Network are propagated as target dependencies.
 The legacy qmake project remains supported.
 
+For a vendored source checkout, use `add_subdirectory(third_party/qamqp)` and
+link `QAMQP::qamqp` instead of maintaining another source list or library version.
+Set `BUILD_SHARED_LIBS=ON` for the shared ABI-1 library or `OFF` for static linking.
+Run the Git-free install/consumer gate with
+`bash tests/files/ci/check-release.sh /tmp/qamqp-package-check`.
+
 Incoming method validation covers connection start/secure/tune/open-ok/close,
 channel open-ok/flow/close, exchange and queue replies, basic delivery/get/return,
 consumer replies, publisher acknowledgements, confirm-select-ok, and transaction
@@ -99,8 +100,16 @@ before handlers can mutate state or emit application signals. Unsupported method
 identifiers, wrong-direction methods, and malformed arguments are rejected with
 `FrameError`; unimplemented protocol extensions are not implicitly accepted.
 
-Usage notes
-------------
+## Essential Contracts
+
+- Configure credentials explicitly; keep each client and its channels on one event loop.
+- Choose receive limits before consuming. No-ack discard cannot be requeued.
+- Handle every publish admission result. Queued/written is not broker-confirmed.
+- Rebuild ABI-0 consumers and update deployment for SONAME 1.
+- Preserve the license/notice package and corresponding library source/build scripts.
+
+<details>
+<summary>Detailed buffering, threading and recovery contract</summary>
 
 #### credentials
 There is no default `guest`/`guest` credential. Call `setUsername()` and
@@ -165,10 +174,10 @@ accounting through inherited mutators.
 `AcceptedForWrite`, `Queued`, `RejectedLimit`, `NotConnected`, or `RejectedInvalid`. `Queued` and
 `AcceptedForWrite` do not mean the broker received or accepted the message; use
 publisher confirms when broker acknowledgement is required. A deferred publish
-queue is limited to 1,000 messages or 16 MiB of fully serialized data per
+queue is limited to 1,000 messages or 16 MiB of conservative reserved data per
 exchange. The client also bounds its asynchronous write backlog; its default
 budget is 16 MiB and can be changed with `QAmqpClient::setMaxWriteQueueBytes()`.
-Setting the client budget to zero disables writes. Exceeding either limit is
+Setting the client budget to zero disables application publishes, not control traffic. Exceeding either limit is
 reported to the caller instead of silently dropping a publish. Writes are
 drained asynchronously, so a slow peer does not block the Qt event loop.
 Protocol traffic has a separate, fixed 64 KiB reserve; it is not included in
@@ -215,8 +224,24 @@ changing another exchange's reservations or the writer backlog. Deferred entries
 and their reservations remain intact across disconnect/reset until replay,
 explicit cancellation, or exchange destruction.
 
-AMQP Support
-------------
+</details>
+
+## Release Verification
+
+The release gates build Git-free source archives with CMake and qmake, install
+shared/static packages into clean prefixes, run external consumers, inspect
+version/SONAME and notice contents, and collect sanitizer and reconnect-soak
+evidence. See [docs/RELEASE.md](docs/RELEASE.md) for the exact commands and gates.
+Release assets carry checksums; use the tagged source and record its commit.
+
+<details>
+<summary>Inherited protocol-method reference</summary>
+
+This reference describes the inherited API surface, not certification of every
+authentication mechanism or broker extension. The validation and migration
+contracts above take precedence over historical platform/support claims.
+
+### AMQP Support
 
 #### connection
 | method | supported |
@@ -298,6 +323,7 @@ AMQP Support
 | confirm.select        | ✓ |
 | confirm.select-ok     | ✓ |
 
-Credits
-------------
+</details>
+
+## Credits
 * Thank you to [@fuCtor](https://github.com/fuCtor) for the original implementation work.

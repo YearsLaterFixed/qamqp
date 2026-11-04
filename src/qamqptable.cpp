@@ -1,4 +1,8 @@
 #include <float.h>
+/* Fork modifications Copyright (C) 2026 Fabian Suhr (YearsLaterFixed).
+ * Modified: 2026-11-04. Upstream: https://github.com/mbroadst/qamqp
+ * Fork/Contact: https://github.com/YearsLaterFixed/qamqp
+ * See LICENSING.md at repository root for inherited rights and notices. */
 
 #include <QDateTime>
 #include <QDebug>
@@ -80,39 +84,34 @@ qint8 valueTypeToOctet(QAmqpMetaType::ValueType type)
 
 namespace {
 const int MAX_FIELD_CONTAINER_DEPTH = 32;
-QThreadStorage<int *> fieldContainerDepth;
+thread_local int fieldContainerDepth = 0;
 
 class FieldContainerDepthGuard
 {
 public:
     FieldContainerDepthGuard(QDataStream &stream)
-        : depth(fieldContainerDepth.localData()), valid(false)
+        : depth(fieldContainerDepth), valid(false)
     {
-        if (!depth) {
-            depth = new int(0);
-            fieldContainerDepth.setLocalData(depth);
-        }
-
-        if (*depth >= MAX_FIELD_CONTAINER_DEPTH) {
+        if (depth >= MAX_FIELD_CONTAINER_DEPTH) {
             qAmqpDebug() << Q_FUNC_INFO << "field container nesting too deep";
             stream.setStatus(QDataStream::ReadCorruptData);
             return;
         }
 
-        ++*depth;
+        ++depth;
         valid = true;
     }
 
     ~FieldContainerDepthGuard()
     {
         if (valid)
-            --*depth;
+            --depth;
     }
 
     bool isValid() const { return valid; }
 
 private:
-    int *depth;
+    int &depth;
     bool valid;
 };
 }
