@@ -32,6 +32,7 @@ private Q_SLOTS:
 
     void messageBodyChunk_data();
     void messageBodyChunk();
+    void queueResetDiscardsPartialMessage();
 
     void fuzzReadAmqpField();
     void fuzzTableFieldValues();
@@ -243,6 +244,40 @@ void tst_QAMQPParser::messageBodyChunk()
     QFETCH(bool, accepted);
 
     QCOMPARE(QAmqpQueuePrivate::isAcceptableBodyChunk(remainingSize, chunkSize), accepted);
+}
+
+void tst_QAMQPParser::queueResetDiscardsPartialMessage()
+{
+    QAmqpQueuePrivate queue(nullptr);
+    queue.channelNumber = 1;
+
+    QAmqpMethodFrame delivery(QAmqpFrame::Basic, QAmqpQueuePrivate::bmDeliver);
+    delivery.setChannel(queue.channelNumber);
+    QByteArray arguments;
+    QDataStream out(&arguments, QIODevice::WriteOnly);
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::ShortString, QString());
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::LongLongUint, 1);
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::Boolean, false);
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::ShortString, "exchange");
+    QAmqpFrame::writeAmqpField(out, QAmqpMetaType::ShortString, "routing-key");
+    delivery.setArguments(arguments);
+    queue.deliver(delivery);
+
+    QAmqpContentFrame header(QAmqpFrame::Basic);
+    header.setChannel(queue.channelNumber);
+    header.setBodySize(8);
+    queue._q_content(header);
+
+    QAmqpContentBodyFrame body;
+    body.setChannel(queue.channelNumber);
+    body.setBody("part");
+    queue._q_body(body);
+    QVERIFY(queue.currentMessage.isValid());
+    QCOMPARE(queue.currentMessage.payload(), QByteArray("part"));
+
+    queue.resetInternalState();
+
+    QVERIFY(!queue.currentMessage.isValid());
 }
 
 void tst_QAMQPParser::fuzzReadAmqpField()

@@ -40,6 +40,7 @@ void QAmqpQueuePrivate::resetInternalState()
     delayedDeclare = false;
     declared = false;
     recievingMessage = false;
+    currentMessage = QAmqpMessage();
     consuming = false;
     consumeRequested = false;
 }
