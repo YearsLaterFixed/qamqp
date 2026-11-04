@@ -26,6 +26,9 @@ private Q_SLOTS:
     void heartbeatNegotiation_data();
     void heartbeatNegotiation();
     void protocolMaximums();
+    void clientPropertiesMerge();
+    void writeQueueReservation_data();
+    void writeQueueReservation();
     void channelAllocationLimit();
     void socketError();
     void invalidUri_data();
@@ -301,6 +304,47 @@ void tst_QAMQPClient::protocolMaximums()
     client.setHeartbeatDelay(65536);
     QCOMPARE(client.channelMax(), qint32(65535));
     QCOMPARE(client.heartbeatDelay(), qint32(65535));
+}
+
+void tst_QAMQPClient::clientPropertiesMerge()
+{
+    QAmqpTable defaults;
+    defaults.insert("version", "0.6.0");
+    defaults.insert("platform", "Qt");
+    QAmqpTable custom;
+    custom.insert("version", "custom-version");
+    custom.insert("operator", "MFT");
+
+    const QAmqpTable merged = QAmqpClientPrivate::mergeClientProperties(defaults, custom);
+    QCOMPARE(merged.value("version").toString(), QString("custom-version"));
+    QCOMPARE(merged.value("platform").toString(), QString("Qt"));
+    QCOMPARE(merged.value("operator").toString(), QString("MFT"));
+}
+
+void tst_QAMQPClient::writeQueueReservation_data()
+{
+    QTest::addColumn<qint64>("bufferedBytes");
+    QTest::addColumn<qint64>("requestedBytes");
+    QTest::addColumn<qint64>("maximumBytes");
+    QTest::addColumn<bool>("accepted");
+
+    QTest::newRow("empty") << qint64(0) << qint64(0) << qint64(10) << true;
+    QTest::newRow("exact-limit") << qint64(6) << qint64(4) << qint64(10) << true;
+    QTest::newRow("one-byte-over") << qint64(6) << qint64(5) << qint64(10) << false;
+    QTest::newRow("already-over-limit") << qint64(11) << qint64(0) << qint64(10) << false;
+    QTest::newRow("negative-request") << qint64(0) << qint64(-1) << qint64(10) << false;
+    QTest::newRow("zero-budget") << qint64(0) << qint64(1) << qint64(0) << false;
+}
+
+void tst_QAMQPClient::writeQueueReservation()
+{
+    QFETCH(qint64, bufferedBytes);
+    QFETCH(qint64, requestedBytes);
+    QFETCH(qint64, maximumBytes);
+    QFETCH(bool, accepted);
+
+    QCOMPARE(QAmqpClientPrivate::canReserveWriteBytes(bufferedBytes, requestedBytes,
+                                                      maximumBytes), accepted);
 }
 
 void tst_QAMQPClient::channelAllocationLimit()

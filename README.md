@@ -27,6 +27,18 @@ A good starting point is:
 * Start the "receive" sample and see in your browser the "hello" queue appear
 * publish a message there
 
+Build and install with CMake (QAMQP 1.0.0 and later):
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build
+cmake --install build
+```
+
+Consumers can use `find_package(QAMQP CONFIG REQUIRED)` and link the exported
+`QAMQP::qamqp` target. Qt Core and Network are propagated as target dependencies.
+The legacy qmake project remains supported.
+
 Usage notes
 ------------
 
@@ -51,13 +63,41 @@ another thread is not safe. Use one `QAmqpClient` per thread rather than sharing
 a single client.
 
 #### message buffering
-`QAmqpQueue` derives from `QQueue<QAmqpMessage>` and buffers delivered messages in
-memory. That buffer is unbounded, so a consumer that does not drain it can grow
-without limit while a producer is fast. Set a prefetch window with
-`QAmqpChannel::qos()` and `dequeue()` messages promptly.
+`QAmqpQueue` buffers delivered messages in memory. Configure limits before
+consuming when the application has a memory budget:
 
-Individual message bodies are bounded: a declared body larger than
-`AMQP_MESSAGE_MAX` (128 MiB) is rejected instead of being accumulated.
+```cpp
+queue->setMaxBufferedMessages(100);
+queue->setMaxBufferedBytes(16 * 1024 * 1024);
+queue->setMaxMessageSize(8 * 1024 * 1024);
+```
+
+A zero message-count or byte limit means unlimited. The default count and byte
+limits are unlimited for compatibility; the default individual message limit is
+`AMQP_MESSAGE_MAX` (128 MiB). Configure `maxMessageSize` lower for constrained
+devices. The queue accounts queued and reassembling payload bytes when deciding
+whether to accept another message.
+
+When a limit is exceeded, the incoming message is discarded and
+`messageDiscarded(deliveryTag, reason)` is emitted; the library does not silently
+drop it. With acknowledged consumption, the application can use the delivery tag
+to choose whether to reject or requeue it. With `coNoAck`, the broker has already
+auto-acknowledged the delivery, so it cannot be redelivered. QoS/prefetch does not
+bound memory for `coNoAck` consumers. Drain the queue promptly with `dequeue()`;
+`QAmqpQueue` no longer publicly inherits `QQueue` so callers cannot bypass byte
+accounting through inherited mutators.
+
+#### publish buffering and delivery
+`QAmqpExchange::publish()` returns a `PublishResult` describing local admission:
+`AcceptedForWrite`, `Queued`, `RejectedLimit`, or `NotConnected`. `Queued` and
+`AcceptedForWrite` do not mean the broker received or accepted the message; use
+publisher confirms when broker acknowledgement is required. A deferred publish
+queue is limited to 1,000 messages or 16 MiB of fully serialized data per
+exchange. The client also bounds its asynchronous write backlog; its default
+budget is 16 MiB and can be changed with `QAmqpClient::setMaxWriteQueueBytes()`.
+Setting the client budget to zero disables writes. Exceeding either limit is
+reported to the caller instead of silently dropping a publish. Writes are
+drained asynchronously, so a slow peer does not block the Qt event loop.
 
 AMQP Support
 ------------

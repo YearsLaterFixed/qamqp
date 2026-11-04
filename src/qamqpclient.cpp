@@ -1,4 +1,5 @@
 #include <QTimer>
+#include <QBuffer>
 #include <QTextStream>
 #include <QStringList>
 #include <QSslSocket>
@@ -25,6 +26,9 @@ QAmqpClientPrivate::QAmqpClientPrivate(QAmqpClient *q)
       connecting(false),
       useSsl(false),
       socket(0),
+    bufferedWriteBytes(0),
+    socketPendingBytes(0),
+    maxWriteQueueBytes(16 * 1024 * 1024),
       closed(false),
       connected(false),
       channelMax(0),
@@ -66,6 +70,8 @@ void QAmqpClientPrivate::initSocket()
     QObject::connect(socket, SIGNAL(connected()), q, SLOT(_q_socketConnected()));
     QObject::connect(socket, SIGNAL(disconnected()), q, SLOT(_q_socketDisconnected()));
     QObject::connect(socket, SIGNAL(readyRead()), q, SLOT(_q_readyRead()));
+    QObject::connect(socket, &QIODevice::bytesWritten, q,
+                     [this](qint64 bytes) { _q_bytesWritten(bytes); });
 #if QT_VERSION >= 0x060000
     QObject::connect(socket,
                      SIGNAL(errorOccurred(QAbstractSocket::SocketError)),
@@ -180,6 +186,57 @@ quint16 QAmqpClientPrivate::negotiateHeartbeat(quint16 clientHeartbeat, quint16 
     return qMin(clientHeartbeat, serverHeartbeat);
 }
 
+QAmqpTable QAmqpClientPrivate::mergeClientProperties(const QAmqpTable &defaults,
+                                                      const QAmqpTable &custom)
+{
+    QAmqpTable properties = defaults;
+    properties.insert(custom);
+    return properties;
+}
+
+bool QAmqpClientPrivate::validateDecodedFrame(const QAmqpFrame &frame,
+                                               QDataStream::Status streamStatus,
+                                               qint64 wirePayloadSize)
+{
+    if (streamStatus != QDataStream::Ok || wirePayloadSize < 0 ||
+        wirePayloadSize > AMQP_FRAME_MAX)
+        return false;
+
+    switch (frame.type()) {
+    case QAmqpFrame::Method: {
+        const QAmqpMethodFrame &method = static_cast<const QAmqpMethodFrame &>(frame);
+        if (method.size() != wirePayloadSize || method.size() < 4)
+            return false;
+
+        switch (method.methodClass()) {
+        case QAmqpFrame::Connection:
+            return method.channel() == 0;
+        case QAmqpFrame::Channel:
+        case QAmqpFrame::Exchange:
+        case QAmqpFrame::Queue:
+        case QAmqpFrame::Basic:
+        case QAmqpFrame::Confirm:
+        case QAmqpFrame::Tx:
+            return method.channel() > 0;
+        }
+        return false;
+    }
+    case QAmqpFrame::Header: {
+        const QAmqpContentFrame &content = static_cast<const QAmqpContentFrame &>(frame);
+        return wirePayloadSize >= 14 && content.size() == wirePayloadSize &&
+               content.methodClass() == QAmqpFrame::Basic && content.channel() > 0;
+    }
+    case QAmqpFrame::Body: {
+        const QAmqpContentBodyFrame &body = static_cast<const QAmqpContentBodyFrame &>(frame);
+        return body.size() == wirePayloadSize && body.channel() > 0;
+    }
+    case QAmqpFrame::Heartbeat:
+        return wirePayloadSize == 0 && frame.channel() == 0;
+    }
+
+    return false;
+}
+
 bool QAmqpClientPrivate::parseConnectionString(const QString &uri)
 {
     QUrl connectionString = QUrl::fromUserInput(uri);
@@ -258,6 +315,12 @@ void QAmqpClientPrivate::_q_socketDisconnected()
 {
     Q_Q(QAmqpClient);
     buffer.clear();
+    const qint64 discardedBytes = socketPendingBytes;
+    pendingWrites.clear();
+    socketPendingBytes = 0;
+    releaseWriteBytes(discardedBytes);
+    if (discardedBytes > 0)
+        Q_EMIT q->writeQueueDiscarded(discardedBytes);
     resetChannelState();
     if (connected)
         connected = false;
@@ -348,16 +411,21 @@ void QAmqpClientPrivate::_q_readyRead()
         {
             QAmqpMethodFrame frame;
             streamB >> frame;
-
-            if (Q_UNLIKELY(frame.size() > frameMax)) {
-                close(QAMQP::FrameError, "frame size too large");
+            if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                close(QAMQP::FrameError, "invalid method frame payload");
                 return;
             }
 
             if (frame.methodClass() == QAmqpFrame::Connection) {
                 _q_method(frame);
             } else {
-                foreach (QAmqpMethodFrameHandler *methodHandler, methodHandlersByChannel[frame.channel()])
+                const QList<QAmqpMethodFrameHandler *> handlers =
+                    methodHandlersByChannel.value(frame.channel());
+                if (handlers.isEmpty()) {
+                    close(QAMQP::ChannelError, "method frame references unknown channel");
+                    return;
+                }
+                foreach (QAmqpMethodFrameHandler *methodHandler, handlers)
                     methodHandler->_q_method(frame);
             }
         }
@@ -366,16 +434,18 @@ void QAmqpClientPrivate::_q_readyRead()
         {
             QAmqpContentFrame frame;
             streamB >> frame;
-
-            if (Q_UNLIKELY(frame.size() > frameMax)) {
-                close(QAMQP::FrameError, "frame size too large");
+            if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                close(QAMQP::FrameError, "invalid content header");
                 return;
-            } else if (Q_UNLIKELY(frame.channel() <= 0)) {
+            }
+            const QList<QAmqpContentFrameHandler *> handlers =
+                contentHandlerByChannel.value(frame.channel());
+            if (handlers.isEmpty()) {
                 close(QAMQP::ChannelError, "channel number must be greater than zero");
                 return;
             }
 
-            foreach (QAmqpContentFrameHandler *methodHandler, contentHandlerByChannel[frame.channel()])
+            foreach (QAmqpContentFrameHandler *methodHandler, handlers)
                 methodHandler->_q_content(frame);
         }
             break;
@@ -383,26 +453,27 @@ void QAmqpClientPrivate::_q_readyRead()
         {
             QAmqpContentBodyFrame frame;
             streamB >> frame;
-
-            if (Q_UNLIKELY(frame.size() > frameMax)) {
-                close(QAMQP::FrameError, "frame size too large");
+            if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                close(QAMQP::FrameError, "invalid content body");
                 return;
-            } else if (Q_UNLIKELY(frame.channel() <= 0)) {
+            }
+            const QList<QAmqpContentBodyFrameHandler *> handlers =
+                bodyHandlersByChannel.value(frame.channel());
+            if (handlers.isEmpty()) {
                 close(QAMQP::ChannelError, "channel number must be greater than zero");
                 return;
             }
 
-            foreach (QAmqpContentBodyFrameHandler *methodHandler, bodyHandlersByChannel[frame.channel()])
+            foreach (QAmqpContentBodyFrameHandler *methodHandler, handlers)
                 methodHandler->_q_body(frame);
         }
             break;
         case QAmqpFrame::Heartbeat:
         {
-            QAmqpMethodFrame frame;
+            QAmqpHeartbeatFrame frame;
             streamB >> frame;
-
-            if (Q_UNLIKELY(frame.channel() != 0)) {
-                close(QAMQP::FrameError, "heartbeat must have channel id zero");
+            if (!validateDecodedFrame(frame, streamB.status(), payloadSize)) {
+                close(QAMQP::FrameError, "invalid heartbeat frame");
                 return;
             }
 
@@ -418,15 +489,115 @@ void QAmqpClientPrivate::_q_readyRead()
     }
 }
 
-void QAmqpClientPrivate::sendFrame(const QAmqpFrame &frame)
+bool QAmqpClientPrivate::canReserveWriteBytes(qint64 bufferedBytes,
+                                              qint64 requestedBytes,
+                                              qint64 maximumBytes)
+{
+    return requestedBytes >= 0 && maximumBytes >= 0 &&
+           bufferedBytes <= maximumBytes && requestedBytes <= maximumBytes - bufferedBytes;
+}
+
+bool QAmqpClientPrivate::reserveWriteBytes(qint64 bytes)
+{
+    if (!canReserveWriteBytes(bufferedWriteBytes, bytes, maxWriteQueueBytes)) {
+        Q_Q(QAmqpClient);
+        Q_EMIT q->writeQueueOverflow(bytes);
+        return false;
+    }
+    bufferedWriteBytes += bytes;
+    return true;
+}
+
+void QAmqpClientPrivate::releaseWriteBytes(qint64 bytes)
+{
+    bufferedWriteBytes = qMax(qint64(0), bufferedWriteBytes - qMax(qint64(0), bytes));
+}
+
+bool QAmqpClientPrivate::sendFrame(const QAmqpFrame &frame)
+{
+    QByteArray data;
+    QBuffer buffer(&data);
+    if (!buffer.open(QIODevice::WriteOnly))
+        return false;
+    QDataStream stream(&buffer);
+    stream << frame;
+    if (stream.status() != QDataStream::Ok)
+        return false;
+    return sendFrameBatch(data);
+}
+
+bool QAmqpClientPrivate::sendFrameBatch(const QByteArray &data, qint64 reservedBytes)
 {
     if (socket->state() != QAbstractSocket::ConnectedState) {
         qAmqpDebug() << Q_FUNC_INFO << "socket not connected: " << socket->state();
-        return;
+        return false;
     }
 
-    QDataStream stream(socket);
-    stream << frame;
+    const qint64 actualBytes = data.size();
+    if (reservedBytes < 0 || reservedBytes > bufferedWriteBytes)
+        return false;
+    const qint64 extraBytes = qMax(qint64(0), actualBytes - reservedBytes);
+    if (extraBytes > 0 &&
+        !canReserveWriteBytes(bufferedWriteBytes, extraBytes, maxWriteQueueBytes)) {
+        Q_Q(QAmqpClient);
+        Q_EMIT q->writeQueueOverflow(actualBytes);
+        return false;
+    }
+
+    bufferedWriteBytes += extraBytes;
+    if (reservedBytes > actualBytes)
+        releaseWriteBytes(reservedBytes - actualBytes);
+
+    PendingWrite pending;
+    pending.data = data;
+    pending.offset = 0;
+    pendingWrites.enqueue(pending);
+    socketPendingBytes += actualBytes;
+    flushPendingWrites();
+    return true;
+}
+
+void QAmqpClientPrivate::flushPendingWrites()
+{
+    if (socket->state() != QAbstractSocket::ConnectedState)
+        return;
+
+    const qint64 socketBufferLimit = 64 * 1024;
+    while (!pendingWrites.isEmpty()) {
+        const qint64 available = socketBufferLimit - socket->bytesToWrite();
+        if (available <= 0)
+            return;
+
+        PendingWrite &pending = pendingWrites.head();
+        const qint64 remaining = pending.data.size() - pending.offset;
+        const qint64 chunkSize = qMin(available, remaining);
+        const qint64 written = socket->write(pending.data.constData() + pending.offset,
+                                              chunkSize);
+        if (written <= 0)
+            return;
+
+        pending.offset += written;
+        if (pending.offset == pending.data.size())
+            pendingWrites.dequeue();
+    }
+}
+
+void QAmqpClientPrivate::_q_bytesWritten(qint64 bytes)
+{
+    const qint64 completed = qMin(bytes, socketPendingBytes);
+    socketPendingBytes -= completed;
+    releaseWriteBytes(completed);
+    flushPendingWrites();
+    flushDeferredPublishes();
+}
+
+void QAmqpClientPrivate::flushDeferredPublishes()
+{
+    foreach (const QString &exchangeName, exchanges.channels()) {
+        QAmqpExchange *exchange = qobject_cast<QAmqpExchange *>(exchanges.get(exchangeName));
+        if (exchange)
+            exchange->d_func()->flushPendingPublishes();
+    }
 }
 
 void QAmqpClientPrivate::closeConnection()
@@ -608,15 +779,11 @@ void QAmqpClientPrivate::startOk()
     QByteArray arguments;
     QDataStream stream(&arguments, QIODevice::WriteOnly);
 
-    QAmqpTable clientProperties;
-    clientProperties["version"] = QString(QAMQP_VERSION);
-    clientProperties["platform"] = QString("Qt %1").arg(qVersion());
-    clientProperties["product"] = QString("QAMQP");
-#if QT_VERSION >= 0x060000
-    clientProperties.insert(customProperties);
-#else
-    clientProperties.unite(customProperties);
-#endif
+    QAmqpTable defaultProperties;
+    defaultProperties["version"] = QString(QAMQP_VERSION);
+    defaultProperties["platform"] = QString("Qt %1").arg(qVersion());
+    defaultProperties["product"] = QString("QAMQP");
+    QAmqpTable clientProperties = mergeClientProperties(defaultProperties, customProperties);
     stream << clientProperties;
 
     authenticator->write(stream);
@@ -943,6 +1110,24 @@ void QAmqpClient::setHeartbeatDelay(qint32 delay)
     }
 
     d->heartbeatDelay = quint16(delay);
+}
+
+qlonglong QAmqpClient::maxWriteQueueBytes() const
+{
+    Q_D(const QAmqpClient);
+    return d->maxWriteQueueBytes;
+}
+
+void QAmqpClient::setMaxWriteQueueBytes(qlonglong bytes)
+{
+    Q_D(QAmqpClient);
+    d->maxWriteQueueBytes = qMax(qlonglong(0), bytes);
+}
+
+qlonglong QAmqpClient::bufferedWriteBytes() const
+{
+    Q_D(const QAmqpClient);
+    return d->bufferedWriteBytes;
 }
 
 int QAmqpClient::writeTimeout() const
