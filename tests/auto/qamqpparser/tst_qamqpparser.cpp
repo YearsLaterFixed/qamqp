@@ -332,6 +332,30 @@ void tst_QAMQPParser::decodedFrameValidation()
     malformedContentIn >> malformedContent;
     QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(malformedContent,
                                                        malformedContentIn.status(), 14));
+
+    QByteArray validContentBytes;
+    QDataStream validContentOut(&validContentBytes, QIODevice::WriteOnly);
+    validContentOut << qint8(QAmqpFrame::Header) << quint16(1) << qint32(25)
+                    << qint16(QAmqpFrame::Basic) << qint16(0) << qlonglong(0)
+                    << quint16(QAmqpMessage::Headers) << quint32(7)
+                    << quint8(1) << qint8('k') << qint8('I') << qint32(1);
+    QDataStream validContentIn(validContentBytes);
+    QAmqpContentFrame validContent;
+    validContentIn >> validContent;
+    QVERIFY(QAmqpClientPrivate::validateDecodedFrame(validContent,
+                                                     validContentIn.status(), 25));
+
+    QByteArray trailingContentBytes;
+    QDataStream trailingContentOut(&trailingContentBytes, QIODevice::WriteOnly);
+    trailingContentOut << qint8(QAmqpFrame::Header) << quint16(1) << qint32(15)
+                       << qint16(QAmqpFrame::Basic) << qint16(0) << qlonglong(0)
+                       << quint16(0) << quint8(0);
+    QDataStream trailingContentIn(trailingContentBytes);
+    QAmqpContentFrame trailingContent;
+    trailingContentIn >> trailingContent;
+    QCOMPARE(trailingContentIn.status(), QDataStream::ReadCorruptData);
+    QVERIFY(!QAmqpClientPrivate::validateDecodedFrame(trailingContent,
+                                                      trailingContentIn.status(), 15));
 }
 
 void tst_QAMQPParser::deeplyNestedArray()

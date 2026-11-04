@@ -223,7 +223,7 @@ bool QAmqpClientPrivate::validateDecodedFrame(const QAmqpFrame &frame,
     }
     case QAmqpFrame::Header: {
         const QAmqpContentFrame &content = static_cast<const QAmqpContentFrame &>(frame);
-        return wirePayloadSize >= 14 && content.size() == wirePayloadSize &&
+        return wirePayloadSize >= 14 &&
                content.methodClass() == QAmqpFrame::Basic && content.channel() > 0;
     }
     case QAmqpFrame::Body: {
@@ -313,6 +313,7 @@ void QAmqpClientPrivate::_q_socketConnected()
 
 void QAmqpClientPrivate::_q_socketDisconnected()
 {
+    pendingChannelCloses.clear();
     Q_Q(QAmqpClient);
     buffer.clear();
     const qint64 discardedBytes = socketPendingBytes;
@@ -421,7 +422,12 @@ void QAmqpClientPrivate::_q_readyRead()
             } else {
                 const QList<QAmqpMethodFrameHandler *> handlers =
                     methodHandlersByChannel.value(frame.channel());
+                const bool expectedCloseReply = frame.methodClass() == QAmqpFrame::Channel &&
+                    frame.id() == QAmqpChannelPrivate::miCloseOk && frame.arguments().isEmpty() &&
+                    pendingChannelCloses.remove(frame.channel()) > 0;
                 if (handlers.isEmpty()) {
+                    if (expectedCloseReply)
+                        break;
                     close(QAMQP::ChannelError, "method frame references unknown channel");
                     return;
                 }
@@ -528,7 +534,15 @@ bool QAmqpClientPrivate::sendFrame(const QAmqpFrame &frame)
         Q_EMIT q->error(error);
         return false;
     }
-    return sendFrameBatch(data);
+    if (!sendFrameBatch(data))
+        return false;
+    if (frame.type() == QAmqpFrame::Method) {
+        const QAmqpMethodFrame &method = static_cast<const QAmqpMethodFrame &>(frame);
+        if (method.methodClass() == QAmqpFrame::Channel &&
+            method.id() == QAmqpChannelPrivate::miClose)
+            pendingChannelCloses.insert(method.channel());
+    }
+    return true;
 }
 
 bool QAmqpClientPrivate::sendFrameBatch(const QByteArray &data, qint64 reservedBytes)

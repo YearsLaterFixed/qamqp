@@ -377,6 +377,11 @@ void tst_QAMQPClient::invalidUri_data()
 
     QTest::newRow("unsupported-scheme") << "http://localhost";
     QTest::newRow("missing-host") << "amqp:///vhost";
+    QTest::newRow("empty") << "amqp://";
+    QTest::newRow("empty2") << "amqp://:@/";
+    QTest::newRow("onlyuser") << "amqp://user@";
+    QTest::newRow("userpass") << "amqp://user:pass@";
+    QTest::newRow("onlyport") << "amqp://:10000";
 }
 
 void tst_QAMQPClient::invalidUri()
@@ -408,13 +413,7 @@ void tst_QAMQPClient::validateUri_data()
         << "user" << "pass" << "host" << quint16(10000) << "vhost";
     QTest::newRow("urlencoded") << "amqp://user%61:%61pass@ho%61st:10000/v%2fhost"
         << "usera" << "apass" << "hoast" << quint16(10000) << "v/host";
-    QTest::newRow("empty") << "amqp://" << "" << "" << "" << quint16(AMQP_PORT) << "";
-    QTest::newRow("empty2") << "amqp://:@/" << "" << "" << "" << quint16(AMQP_PORT) << "/";
-    QTest::newRow("onlyuser") << "amqp://user@" << "user" << "" << "" << quint16(AMQP_PORT) << "";
-    QTest::newRow("userpass") << "amqp://user:pass@" << "user" << "pass" << "" << quint16(AMQP_PORT) << "";
     QTest::newRow("onlyhost") << "amqp://host" << "" << "" << "host" << quint16(AMQP_PORT) << "";
-    QTest::newRow("onlyport") << "amqp://:10000" << "" << "" << "" << quint16(10000) << "";
-    QTest::newRow("onlyvhost") << "amqp:///vhost" << "" << "" << "" << quint16(AMQP_PORT) << "vhost";
     QTest::newRow("urlencodedvhost") << "amqp://host/%2f"
         << "" << "" << "host" << quint16(AMQP_PORT) << "/";
     QTest::newRow("ipv6") << "amqp://[::1]" << "" << "" << "::1" << quint16(AMQP_PORT) << "";
@@ -435,7 +434,7 @@ void tst_QAMQPClient::validateUri()
         new QAmqpPlainAuthenticator(QString(), QString()));
 
     // test parsing
-    clientPrivate.parseConnectionString(uri);
+    QVERIFY(clientPrivate.parseConnectionString(uri));
     QAmqpPlainAuthenticator *auth =
         static_cast<QAmqpPlainAuthenticator*>(clientPrivate.authenticator.data());
 

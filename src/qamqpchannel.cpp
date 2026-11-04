@@ -35,6 +35,18 @@ void QAmqpChannelPrivate::init(int channel, QAmqpClient *c)
     const quint16 previousChannelNumber = clientPriv->nextChannelNumber;
     channelNumber = clientPriv->allocateChannelNumber(channel);
     needOpen = channelNumber && (channel == -1 || channel > previousChannelNumber);
+    if (!needOpen && channelNumber) {
+        const QList<QAmqpMethodFrameHandler *> handlers =
+            clientPriv->methodHandlersByChannel.value(channelNumber);
+        foreach (QAmqpMethodFrameHandler *handler, handlers) {
+            QAmqpChannelPrivate *sharedChannel = dynamic_cast<QAmqpChannelPrivate *>(handler);
+            if (sharedChannel && sharedChannel->opened) {
+                opened = true;
+                flowActive = sharedChannel->flowActive;
+                break;
+            }
+        }
+    }
 }
 
 bool QAmqpChannelPrivate::_q_method(const QAmqpMethodFrame &frame)

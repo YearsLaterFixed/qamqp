@@ -111,8 +111,10 @@ void tst_QAMQPExchange::invalidDeclaration()
 {
     QAmqpExchange *exchange = client->createExchange("test-invalid-declaration");
     exchange->declare("invalidExchangeType");
-    QVERIFY(waitForSignal(client.data(), SIGNAL(error(QAMQP::Error))));
-    QCOMPARE(client->error(), QAMQP::CommandInvalidError);
+
+    QVERIFY(waitForSignal(exchange, SIGNAL(error(QAMQP::Error))));
+    QCOMPARE(exchange->error(), QAMQP::PreconditionFailedError);
+    QVERIFY(client->isConnected());
 }
 
 void tst_QAMQPExchange::invalidRedeclaration()
@@ -211,6 +213,7 @@ void tst_QAMQPExchange::passiveDeclareNotFound()
 
 void tst_QAMQPExchange::cleanupOnDeletion()
 {
+    QSignalSpy errors(client.data(), SIGNAL(error(QAMQP::Error)));
     // create, declare, and close the wrong way
     QAmqpExchange *exchange = client->createExchange("test-deletion");
     exchange->declare();
@@ -225,6 +228,8 @@ void tst_QAMQPExchange::cleanupOnDeletion()
     QVERIFY(waitForSignal(exchange, SIGNAL(declared())));
     exchange->close();
     QVERIFY(waitForSignal(exchange, SIGNAL(closed())));
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(client->isConnected());
 }
 
 void tst_QAMQPExchange::testQueuedPublish()

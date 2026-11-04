@@ -27,6 +27,30 @@ A good starting point is:
 * Start the "receive" sample and see in your browser the "hello" queue appear
 * publish a message there
 
+## Testing
+
+GitHub Actions runs the parser and channel-flow suites without a broker on Qt
+5.15.2 and Qt 6.5.3. A separate Qt 5.15.2 job starts RabbitMQ with the test TLS
+certificates and runs the client, exchange, queue, and channel integration
+suites, including reconnect tests.
+
+To build the library and all test targets locally with qmake:
+
+```bash
+cd src
+qmake src.pro
+make -j2
+cd ../tests/auto
+for test in qamqpparser qamqpflow qamqpclient qamqpexchange qamqpqueue qamqpchannel; do
+	(cd "$test" && qmake "$test.pro" && make -j2)
+done
+```
+
+Run `tst_qamqpparser` and `tst_qamqpflow` without RabbitMQ. The other test
+executables require RabbitMQ on `localhost:5672`; `tst_qamqpclient` TLS tests
+also require a TLS listener on port 5671. The CI workflow shows the service
+configuration and the RabbitMQ control wrapper needed by reconnect tests.
+
 Build and install with CMake (QAMQP 1.0.0 and later):
 
 ```bash

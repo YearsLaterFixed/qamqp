@@ -94,7 +94,11 @@ QDataStream &operator>>(QDataStream &stream, QAmqpFrame &frame)
     stream >> frame.type_;
     stream >> frame.channel_;
     stream >> frame.size_;
+    const qint64 payloadStart = stream.device()->pos();
     frame.readPayload(stream);
+    if (stream.status() == QDataStream::Ok &&
+        stream.device()->pos() - payloadStart != frame.size_)
+        stream.setStatus(QDataStream::ReadCorruptData);
     return stream;
 }
 

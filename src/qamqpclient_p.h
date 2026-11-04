@@ -5,6 +5,7 @@
 #include <QSharedPointer>
 #include <QPointer>
 #include <QQueue>
+#include <QSet>
 #include <QAbstractSocket>
 #include <QSslError>
 
@@ -115,6 +116,7 @@ public:
     qint64 bufferedWriteBytes;
     qint64 socketPendingBytes;
     qint64 maxWriteQueueBytes;
+    QSet<quint16> pendingChannelCloses;
     QHash<quint16, QList<QAmqpMethodFrameHandler*> > methodHandlersByChannel;
     QHash<quint16, QList<QAmqpContentFrameHandler*> > contentHandlerByChannel;
     QHash<quint16, QList<QAmqpContentBodyFrameHandler*> > bodyHandlersByChannel;
