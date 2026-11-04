@@ -18,8 +18,6 @@
 #ifndef QAMQPQUEUE_H
 #define QAMQPQUEUE_H
 
-#include <QQueue>
-
 #include "qamqpchannel.h"
 #include "qamqpmessage.h"
 #include "qamqpglobal.h"
@@ -29,13 +27,24 @@ class QAmqpClient;
 class QAmqpClientPrivate;
 class QAmqpExchange;
 class QAmqpQueuePrivate;
-class QAMQP_EXPORT QAmqpQueue : public QAmqpChannel, public QQueue<QAmqpMessage>
+class QAMQP_EXPORT QAmqpQueue : public QAmqpChannel
 {
     Q_OBJECT
     Q_PROPERTY(int options READ options CONSTANT)
     Q_PROPERTY(QString consumerTag READ consumerTag WRITE setConsumerTag)
+    Q_PROPERTY(int maxBufferedMessages READ maxBufferedMessages WRITE setMaxBufferedMessages)
+    Q_PROPERTY(qlonglong maxBufferedBytes READ maxBufferedBytes WRITE setMaxBufferedBytes)
+    Q_PROPERTY(qlonglong maxMessageSize READ maxMessageSize WRITE setMaxMessageSize)
 
 public:
+    enum OverflowReason {
+        NoOverflow = -1,
+        MessageSizeLimitExceeded,
+        BufferedMessageCountLimitExceeded,
+        BufferedByteLimitExceeded
+    };
+    Q_ENUM(OverflowReason)
+
     enum QueueOption {
         NoOptions = 0x0,
         Passive = 0x01,
@@ -78,6 +87,22 @@ public:
     qint32 messageCount() const;
     qint32 consumerCount() const;
 
+    // A zero limit is unlimited. Defaults preserve the historical queue limits,
+    // while individual messages remain capped by AMQP_MESSAGE_MAX.
+    int maxBufferedMessages() const;
+    void setMaxBufferedMessages(int maximum);
+    qlonglong maxBufferedBytes() const;
+    void setMaxBufferedBytes(qlonglong maximum);
+    qlonglong maxMessageSize() const;
+    void setMaxMessageSize(qlonglong maximum);
+    int bufferedMessageCount() const;
+    qlonglong bufferedMessageBytes() const;
+
+    int size() const;
+    bool isEmpty() const;
+    QAmqpMessage head() const;
+    QAmqpMessage dequeue();
+    void clear();
 Q_SIGNALS:
     void declared();
     void bound();
@@ -86,6 +111,7 @@ Q_SIGNALS:
     void purged(int messageCount);
 
     void messageReceived();
+    void messageDiscarded(qlonglong deliveryTag, QAmqpQueue::OverflowReason reason);
     void empty();
     void consuming(const QString &consumerTag);
     void cancelled(const QString &consumerTag);
@@ -125,7 +151,10 @@ private:
     Q_DECLARE_PRIVATE(QAmqpQueue)
     friend class QAmqpClient;
     friend class QAmqpClientPrivate;
+    friend class QAmqpQueuePrivate;
 
 };
+
+Q_DECLARE_METATYPE(QAmqpQueue::OverflowReason)
 
 #endif  // QAMQPQUEUE_H
