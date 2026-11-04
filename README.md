@@ -63,6 +63,15 @@ Consumers can use `find_package(QAMQP CONFIG REQUIRED)` and link the exported
 `QAMQP::qamqp` target. Qt Core and Network are propagated as target dependencies.
 The legacy qmake project remains supported.
 
+Incoming method validation covers connection start/secure/tune/open-ok/close,
+channel open-ok/flow/close, exchange and queue replies, basic delivery/get/return,
+consumer replies, publisher acknowledgements, confirm-select-ok, and transaction
+replies. Methods are validated for complete arguments, bounded strings/tables,
+defined packed bits, applicable value constraints, and no trailing arguments
+before handlers can mutate state or emit application signals. Unsupported method
+identifiers, wrong-direction methods, and malformed arguments are rejected with
+`FrameError`; unimplemented protocol extensions are not implicitly accepted.
+
 Usage notes
 ------------
 

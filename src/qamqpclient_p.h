@@ -65,6 +65,7 @@ public:
     static bool validateDecodedFrame(const QAmqpFrame &frame,
                                      QDataStream::Status streamStatus,
                                      qint64 wirePayloadSize);
+    static bool validateMethodArguments(const QAmqpMethodFrame &frame);
 
     void closeConnection();
 
