@@ -137,6 +137,24 @@ stalled peer drain, and never introduces blocking writes or unbounded buffering.
 Short strings exceeding 255 UTF-8 bytes are rejected before admission, without
 truncation or a write reservation. Invalid publishes return `RejectedInvalid`
 and emit `publishRejected(InvalidShortString)` once.
+Deferred publishes retain their payload and serialized method/header frames,
+not body frames built for an earlier connection. Admission reserves twice the
+worst-case wire size at the AMQP minimum frame limit (4096 bytes, including
+eight-byte frame overhead): one copy for retained data and one for bounded
+serialization staging. This conservative charge counts against both the client
+budget and the per-exchange deferred-byte limit. It can reduce the maximum
+admissible payload compared with a wire-only budget.
+Body frames are rebuilt for the current negotiated limit before transfer to
+the writer; unused reservation is released during that transfer. Nonfragmentable
+method/header frames must fit the conservative limit before a publish is queued,
+or the current limit for an immediately written publish. Otherwise admission
+returns `RejectedLimit` and emits `publishRejected(FrameSizeLimitExceeded)`.
+An unexpected permanent framing/encoding failure of an already queued entry
+releases its reservation and emits `publishFailed(error)` once. Transient
+disconnection keeps a deferred entry reserved for replay. Once ownership has
+transferred to the writer, transport failure is reported through client errors
+and `writeQueueDiscarded`; those bytes are not retained for replay. Neither
+replay nor local admission implies exactly-once delivery or broker confirmation.
 `cancelPendingPublishes()` explicitly cancels only this exchange's deferred
 publishes, returns their count, and emits
 `pendingPublishesCancelled(count, reservedBytes)` once when that count is nonzero.
