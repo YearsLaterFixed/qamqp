@@ -54,6 +54,8 @@ private Q_SLOTS:
     void queueBufferLimitConfiguration();
     void queueBufferAccountingAndOverflow();
     void queueProtocolBodyCapEmitsDiscard();
+    void partialBodyDisconnectResetsDelivery_data();
+    void partialBodyDisconnectResetsDelivery();
 
     void fuzzReadAmqpField();
     void fuzzTableFieldValues();
@@ -907,6 +909,169 @@ void tst_QAMQPParser::queueProtocolBodyCapEmitsDiscard()
     QCOMPARE(discarded.at(0).at(1).value<QAmqpQueue::OverflowReason>(),
              QAmqpQueue::MessageSizeLimitExceeded);
     QVERIFY(!queue.currentMessage.isValid());
+}
+
+class PartialDeliveryClient : public QAmqpClient
+{
+public:
+    QAmqpClientPrivate *state() { return d_func(); }
+};
+
+static QByteArray serializeTestFrame(const QAmqpFrame &frame)
+{
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    stream << frame;
+    return bytes;
+}
+
+void tst_QAMQPParser::partialBodyDisconnectResetsDelivery_data()
+{
+    QTest::addColumn<bool>("incompleteWireFrame");
+    QTest::newRow("between-body-frames") << false;
+    QTest::newRow("inside-next-body-frame") << true;
+}
+
+void tst_QAMQPParser::partialBodyDisconnectResetsDelivery()
+{
+    QFETCH(bool, incompleteWireFrame);
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    PartialDeliveryClient client;
+    client.setHost("127.0.0.1");
+    client.setPort(server.serverPort());
+    QAmqpQueue *queue = client.createQueue("partial-body-reset");
+    QVERIFY(queue);
+    queue->setMaxMessageSize(16384);
+    queue->setMaxBufferedBytes(16384);
+    queue->setMaxBufferedMessages(2);
+    queue->declare(QAmqpQueue::Durable);
+    QObject::connect(queue, &QAmqpQueue::declared, &client,
+                     [queue] { queue->consume(QAmqpQueue::coNoAck); });
+    QAmqpClientPrivate &state = *client.state();
+    QAmqpQueuePrivate *queueState = dynamic_cast<QAmqpQueuePrivate *>(
+        state.methodHandlersByChannel.value(queue->channelNumber()).first());
+    QVERIFY(queueState);
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy disconnected(&client, &QAmqpClient::disconnected);
+    QSignalSpy consuming(queue, &QAmqpQueue::consuming);
+    QSignalSpy received(queue, &QAmqpQueue::messageReceived);
+    QSignalSpy discarded(queue, &QAmqpQueue::messageDiscarded);
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    int sessions = 0;
+    QPointer<QTcpSocket> peer;
+    QString consumerTag;
+    QObject::connect(&server, &QTcpServer::newConnection, &client, [&] {
+        peer = server.nextPendingConnection();
+        ++sessions;
+        consumerTag = QString("consumer-%1").arg(sessions);
+        QAmqpMethodFrame tune(QAmqpFrame::Connection, QAmqpClientPrivate::miTune);
+        QByteArray tuneArguments;
+        QDataStream tuneStream(&tuneArguments, QIODevice::WriteOnly);
+        tuneStream << quint16(16) << quint32(4096) << quint16(0);
+        tune.setArguments(tuneArguments);
+        QAmqpMethodFrame connectionOpen(QAmqpFrame::Connection, QAmqpClientPrivate::miOpenOk);
+        connectionOpen.setArguments(encodedString(QString(), QAmqpMetaType::ShortString));
+        QAmqpMethodFrame channelOpen(QAmqpFrame::Channel, QAmqpChannelPrivate::miOpenOk);
+        channelOpen.setChannel(queue->channelNumber());
+        channelOpen.setArguments(encodedString(QString(), QAmqpMetaType::LongString));
+        QAmqpMethodFrame declared(QAmqpFrame::Queue, QAmqpQueuePrivate::miDeclareOk);
+        declared.setChannel(queue->channelNumber());
+        QByteArray declaration = encodedString(queue->name(), QAmqpMetaType::ShortString);
+        QDataStream declarationStream(&declaration, QIODevice::Append);
+        declarationStream << quint32(0) << quint32(0);
+        declared.setArguments(declaration);
+        QAmqpMethodFrame consume(QAmqpFrame::Basic, QAmqpChannelPrivate::bmConsumeOk);
+        consume.setChannel(queue->channelNumber());
+        consume.setArguments(encodedString(consumerTag, QAmqpMetaType::ShortString));
+        peer->write(serializeTestFrame(tune) + serializeTestFrame(connectionOpen) +
+                    serializeTestFrame(channelOpen) + serializeTestFrame(declared) +
+                    serializeTestFrame(consume));
+        peer->flush();
+    });
+    const auto delivery = [&](qulonglong tag, int bodySize) {
+        QAmqpMethodFrame delivered(QAmqpFrame::Basic, QAmqpChannelPrivate::bmDeliver);
+        delivered.setChannel(queue->channelNumber());
+        QByteArray arguments = encodedString(consumerTag, QAmqpMetaType::ShortString);
+        QDataStream stream(&arguments, QIODevice::Append);
+        stream << tag << quint8(0);
+        QAmqpFrame::writeAmqpField(stream, QAmqpMetaType::ShortString, "exchange");
+        QAmqpFrame::writeAmqpField(stream, QAmqpMetaType::ShortString, "route");
+        delivered.setArguments(arguments);
+        QAmqpContentFrame content(QAmqpFrame::Basic);
+        content.setChannel(queue->channelNumber());
+        content.setBodySize(bodySize);
+        return serializeTestFrame(delivered) + serializeTestFrame(content);
+    };
+    const auto bodyFrame = [&](const QByteArray &payload) {
+        QAmqpContentBodyFrame body;
+        body.setChannel(queue->channelNumber());
+        body.setBody(payload);
+        return serializeTestFrame(body);
+    };
+
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        client.connectToHost();
+        QTRY_COMPARE(consuming.count(), cycle * 2 + 1);
+        QVERIFY(peer);
+        QVERIFY(queue->isConsuming());
+        const QByteArray partial(2048, 'x');
+        peer->write(delivery(1, 10000) + bodyFrame(partial));
+        if (incompleteWireFrame)
+            peer->write(bodyFrame(QByteArray(2048, 'y')).left(100));
+        peer->flush();
+        QTRY_COMPARE(queueState->currentMessage.payload(), partial);
+        QVERIFY(queueState->currentMessage.isValid());
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(partial.size()));
+        QCOMPARE(queue->bufferedMessageCount(), 1);
+        QCOMPARE(received.count(), cycle);
+        QVERIFY(queue->isEmpty());
+        peer->abort();
+        QTRY_COMPARE(disconnected.count(), cycle * 2 + 1);
+        QVERIFY(!queueState->currentMessage.isValid());
+        QVERIFY(queueState->currentMessage.payload().isEmpty());
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(0));
+        QCOMPARE(queue->bufferedMessageCount(), 0);
+        QVERIFY(!queue->isConsuming());
+        state.resetChannelState();
+        state.resetChannelState();
+        QVERIFY(!queueState->currentMessage.isValid());
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(0));
+        QCOMPARE(received.count(), cycle);
+
+        queue->declare(QAmqpQueue::Durable);
+        client.connectToHost();
+        QTRY_COMPARE(consuming.count(), cycle * 2 + 2);
+        QVERIFY(queue->isConsuming());
+        const QByteArray payload(10000, char('a' + cycle));
+        QByteArray wire = delivery(1, payload.size());
+        for (int offset = 0; offset < payload.size(); offset += 2048)
+            wire += bodyFrame(payload.mid(offset, 2048));
+        peer->write(wire);
+        peer->flush();
+        QTRY_COMPARE(received.count(), cycle + 1);
+        QCOMPARE(queue->bufferedMessageCount(), 1);
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(payload.size()));
+        QVERIFY(!queueState->currentMessage.isValid());
+        const QAmqpMessage message = queue->dequeue();
+        QCOMPARE(message.payload(), payload);
+        QCOMPARE(message.deliveryTag(), qlonglong(1));
+        QCOMPARE(message.exchangeName(), QString("exchange"));
+        QCOMPARE(message.routingKey(), QString("route"));
+        QCOMPARE(queue->bufferedMessageBytes(), qlonglong(0));
+        QCOMPARE(queue->bufferedMessageCount(), 0);
+        peer->abort();
+        QTRY_COMPARE(disconnected.count(), cycle * 2 + 2);
+        queue->declare(QAmqpQueue::Durable);
+    }
+    QCOMPARE(connected.count(), 6);
+    QCOMPARE(consuming.count(), 6);
+    QCOMPARE(received.count(), 3);
+    QCOMPARE(discarded.count(), 0);
+    QCOMPARE(errors.count(), 0);
 }
 
 void tst_QAMQPParser::fuzzReadAmqpField()
