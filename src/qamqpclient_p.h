@@ -4,6 +4,7 @@
 #include <QHash>
 #include <QSharedPointer>
 #include <QPointer>
+#include <QQueue>
 #include <QAbstractSocket>
 #include <QSslError>
 
@@ -42,7 +43,15 @@ public:
     void setUsername(const QString &username);
     void setPassword(const QString &password);
     bool parseConnectionString(const QString &uri);
-    void sendFrame(const QAmqpFrame &frame);
+    bool sendFrame(const QAmqpFrame &frame);
+    bool sendFrameBatch(const QByteArray &data, qint64 reservedBytes = 0);
+    bool reserveWriteBytes(qint64 bytes);
+    void releaseWriteBytes(qint64 bytes);
+    void flushPendingWrites();
+    void flushDeferredPublishes();
+    void _q_bytesWritten(qint64 bytes);
+    static bool canReserveWriteBytes(qint64 bufferedBytes, qint64 requestedBytes,
+                                     qint64 maximumBytes);
     quint16 allocateChannelNumber(int requestedChannelNumber);
     static quint16 negotiateChannelMax(quint16 clientChannelMax, quint16 serverChannelMax);
     static qint32 negotiateFrameMax(qint32 clientFrameMax, qint32 serverFrameMax);
@@ -93,6 +102,14 @@ public:
     bool useSsl;
 
     QSslSocket *socket;
+    struct PendingWrite {
+        QByteArray data;
+        qint64 offset;
+    };
+    QQueue<PendingWrite> pendingWrites;
+    qint64 bufferedWriteBytes;
+    qint64 socketPendingBytes;
+    qint64 maxWriteQueueBytes;
     QHash<quint16, QList<QAmqpMethodFrameHandler*> > methodHandlersByChannel;
     QHash<quint16, QList<QAmqpContentFrameHandler*> > contentHandlerByChannel;
     QHash<quint16, QList<QAmqpContentBodyFrameHandler*> > bodyHandlersByChannel;

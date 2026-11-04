@@ -2,6 +2,7 @@
 #include <QDataStream>
 #include <QTimer>
 #include <QDebug>
+#include <QBuffer>
 
 #include "qamqpexchange.h"
 #include "qamqpexchange_p.h"
@@ -55,9 +56,11 @@ void QAmqpExchangePrivate::flushPendingPublishes()
         return;
 
     while (!pendingPublishes.isEmpty()) {
-        PendingPublish publish = pendingPublishes.dequeue();
-        pendingPublishBytes -= publish.message.size();
-        sendPublish(publish);
+        const PendingPublish &publish = pendingPublishes.head();
+        if (sendPublish(publish) != QAmqpExchange::AcceptedForWrite)
+            return;
+        pendingPublishBytes -= publish.encoded.size();
+        pendingPublishes.dequeue();
     }
 }
 
@@ -300,25 +303,31 @@ void QAmqpExchange::remove(int options)
     d->sendFrame(frame);
 }
 
-void QAmqpExchange::publish(const QString &message, const QString &routingKey,
-                            const QAmqpMessage::PropertyHash &properties, int publishOptions)
+QAmqpExchange::PublishResult QAmqpExchange::publish(
+    const QString &message, const QString &routingKey,
+    const QAmqpMessage::PropertyHash &properties, int publishOptions)
 {
-    publish(message.toUtf8(), routingKey, QLatin1String("text.plain"),
-            QAmqpTable(), properties, publishOptions);
+    return publish(message.toUtf8(), routingKey, QLatin1String("text.plain"),
+                   QAmqpTable(), properties, publishOptions);
 }
 
-void QAmqpExchange::publish(const QByteArray &message, const QString &routingKey,
-                            const QString &mimeType, const QAmqpMessage::PropertyHash &properties,
-                            int publishOptions)
+QAmqpExchange::PublishResult QAmqpExchange::publish(
+    const QByteArray &message, const QString &routingKey,
+    const QString &mimeType, const QAmqpMessage::PropertyHash &properties,
+    int publishOptions)
 {
-    publish(message, routingKey, mimeType, QAmqpTable(), properties, publishOptions);
+    return publish(message, routingKey, mimeType, QAmqpTable(), properties, publishOptions);
 }
 
-void QAmqpExchange::publish(const QByteArray &message, const QString &routingKey,
-                            const QString &mimeType, const QAmqpTable &headers,
-                            const QAmqpMessage::PropertyHash &properties, int publishOptions)
+QAmqpExchange::PublishResult QAmqpExchange::publish(
+    const QByteArray &message, const QString &routingKey, const QString &mimeType,
+    const QAmqpTable &headers, const QAmqpMessage::PropertyHash &properties,
+    int publishOptions)
 {
     Q_D(QAmqpExchange);
+    if (message.size() > d->client->maxWriteQueueBytes())
+        return RejectedLimit;
+
     QAmqpExchangePrivate::PendingPublish publish;
     publish.message = message;
     publish.routingKey = routingKey;
@@ -326,30 +335,41 @@ void QAmqpExchange::publish(const QByteArray &message, const QString &routingKey
     publish.headers = headers;
     publish.properties = properties;
     publish.publishOptions = publishOptions;
+    publish.encoded = d->serializePublish(publish);
+    publish.hasWriteReservation = false;
+    publish.message.clear();
+    publish.routingKey.clear();
+    publish.mimeType.clear();
+    publish.headers.clear();
+    publish.properties.clear();
+    if (publish.encoded.isEmpty())
+        return RejectedLimit;
 
     if (QAmqpExchangePrivate::shouldDeferPublish(d->opened, d->flowActive)) {
-        // Bound pending publishes so an unavailable broker, or one that has paused
-        // the channel via channel.flow, cannot exhaust memory.
+        // Bound the complete serialized publish, including protocol metadata.
         if (d->pendingPublishes.size() >= 1000 ||
-            d->pendingPublishBytes + message.size() > 16 * 1024 * 1024) {
-            qAmqpDebug() << Q_FUNC_INFO << "pending publish limit reached, dropping message";
-            return;
+            d->pendingPublishBytes + publish.encoded.size() > 16 * 1024 * 1024 ||
+            !d->reserveWriteBytes(publish.encoded.size())) {
+            qAmqpDebug() << Q_FUNC_INFO << "pending publish limit reached";
+            return RejectedLimit;
         }
 
+        publish.hasWriteReservation = true;
         d->pendingPublishes.enqueue(publish);
-        d->pendingPublishBytes += message.size();
-        return;
+        d->pendingPublishBytes += publish.encoded.size();
+        return Queued;
     }
 
-    d->sendPublish(publish);
+    return d->sendPublish(publish);
 }
 
-void QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
+QByteArray QAmqpExchangePrivate::serializePublish(const PendingPublish &publish) const
 {
-    if (nextDeliveryTag > 0) {
-        unconfirmedDeliveryTags.append(nextDeliveryTag);
-        nextDeliveryTag++;
-    }
+    QByteArray data;
+    QBuffer buffer(&data);
+    if (!buffer.open(QIODevice::WriteOnly))
+        return QByteArray();
+    QDataStream stream(&buffer);
 
     QAmqpMethodFrame frame(QAmqpFrame::Basic, QAmqpExchangePrivate::bmPublish);
     frame.setChannel(channelNumber);
@@ -368,7 +388,7 @@ void QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
                publish.publishOptions & QAmqpExchange::poImmediate);
 
     frame.setArguments(arguments);
-    sendFrame(frame);
+    stream << frame;
 
     QAmqpContentFrame content(QAmqpFrame::Basic);
     content.setChannel(channelNumber);
@@ -381,7 +401,7 @@ void QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
     for (it = publish.properties.constBegin(); it != itEnd; ++it)
         content.setProperty(it.key(), it.value());
     content.setBodySize(publish.message.size());
-    sendFrame(content);
+    stream << content;
 
     int fullSize = publish.message.size();
     // frame-max bounds the entire frame, so a body chunk must leave room for the
@@ -395,8 +415,26 @@ void QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
         QByteArray partition = publish.message.mid(sent, chunkSize);
         body.setChannel(channelNumber);
         body.setBody(partition);
-        sendFrame(body);
+        stream << body;
     }
+
+    return stream.status() == QDataStream::Ok ? data : QByteArray();
+}
+
+QAmqpExchange::PublishResult QAmqpExchangePrivate::sendPublish(const PendingPublish &publish)
+{
+    if (!client || !client->isConnected() ||
+        client->socketState() != QAbstractSocket::ConnectedState)
+        return QAmqpExchange::NotConnected;
+    if (!sendFrameBatch(publish.encoded,
+                        publish.hasWriteReservation ? publish.encoded.size() : 0))
+        return QAmqpExchange::RejectedLimit;
+
+    if (nextDeliveryTag > 0) {
+        unconfirmedDeliveryTags.append(nextDeliveryTag);
+        nextDeliveryTag++;
+    }
+    return QAmqpExchange::AcceptedForWrite;
 }
 
 void QAmqpExchange::enableConfirms(bool noWait)
