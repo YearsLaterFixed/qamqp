@@ -47,6 +47,14 @@ There is no default `guest`/`guest` credential. Call `setUsername()` and
 `setPassword()` (or supply a `QAmqpAuthenticator` via `setAuth()`) before
 connecting, or pass them in the connection URI.
 
+#### protocol limits
+`QAmqpClient::channelMax()` and `heartbeatDelay()` expose signed 32-bit values
+so setters can reject negative or above-range input before narrowing to the
+unsigned 16-bit AMQP wire fields. Valid values are 0-65,535. Zero means
+unlimited channels or disabled heartbeats, as defined by the protocol. Callers
+should handle the setter's range contract and update code that stored these
+properties as `qint16` to use at least `qint32`.
+
 #### thread affinity
 A `QAmqpClient`, and every channel, exchange and queue it creates, must be used
 from the thread that owns the client's event loop. Most of the API is invoked

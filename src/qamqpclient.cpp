@@ -177,14 +177,8 @@ qint32 QAmqpClientPrivate::negotiateFrameMax(qint32 clientFrameMax, qint32 serve
     return negotiated;
 }
 
-qint16 QAmqpClientPrivate::negotiateHeartbeat(qint16 clientHeartbeat, qint16 serverHeartbeat)
+quint16 QAmqpClientPrivate::negotiateHeartbeat(quint16 clientHeartbeat, quint16 serverHeartbeat)
 {
-    // a negative delay can only come from a malformed tune frame; treat it as disabled
-    if (clientHeartbeat < 0)
-        clientHeartbeat = 0;
-    if (serverHeartbeat < 0)
-        serverHeartbeat = 0;
-
     if (!clientHeartbeat)
         return serverHeartbeat;
     if (!serverHeartbeat)
@@ -704,7 +698,7 @@ void QAmqpClientPrivate::tune(const QAmqpMethodFrame &frame)
 
     frameMax = negotiateFrameMax(frameMax, frame_max);
     channelMax = negotiateChannelMax(channelMax, channel_max);
-    heartbeatDelay = negotiateHeartbeat(heartbeatDelay, qint16(heartbeat_delay));
+    heartbeatDelay = negotiateHeartbeat(heartbeatDelay, heartbeat_delay);
 
     qAmqpDebug("-> connection#tune( channel_max=%d, frame_max=%d, heartbeat=%d )",
                channelMax, frameMax, heartbeatDelay);
@@ -811,9 +805,9 @@ void QAmqpClientPrivate::tuneOk()
     QByteArray arguments;
     QDataStream stream(&arguments, QIODevice::WriteOnly);
 
-    stream << qint16(channelMax);
+    stream << quint16(channelMax);
     stream << qint32(frameMax);
-    stream << qint16(heartbeatDelay);
+    stream << quint16(heartbeatDelay);
 
     qAmqpDebug("<- connection#tuneOk( channelMax=%d, frameMax=%d, heartbeatDelay=%d )",
                channelMax, frameMax, heartbeatDelay);
@@ -1057,13 +1051,13 @@ void QAmqpClient::setAutoReconnect(bool value, int timeout)
     }
 }
 
-qint16 QAmqpClient::channelMax() const
+qint32 QAmqpClient::channelMax() const
 {
     Q_D(const QAmqpClient);
-    return qint16(d->channelMax);
+    return d->channelMax;
 }
 
-void QAmqpClient::setChannelMax(qint16 channelMax)
+void QAmqpClient::setChannelMax(qint32 channelMax)
 {
     Q_D(QAmqpClient);
     if (d->connected) {
@@ -1071,7 +1065,12 @@ void QAmqpClient::setChannelMax(qint16 channelMax)
         return;
     }
 
-    d->channelMax = qMax(channelMax, qint16(0));
+    if (channelMax < 0 || channelMax > USHRT_MAX) {
+        qAmqpDebug() << Q_FUNC_INFO << "channel-max must be in the range 0..65535";
+        return;
+    }
+
+    d->channelMax = quint16(channelMax);
 }
 
 qint32 QAmqpClient::frameMax() const
@@ -1091,13 +1090,13 @@ void QAmqpClient::setFrameMax(qint32 frameMax)
     d->frameMax = qMax(frameMax, AMQP_FRAME_MIN_SIZE);
 }
 
-qint16 QAmqpClient::heartbeatDelay() const
+qint32 QAmqpClient::heartbeatDelay() const
 {
     Q_D(const QAmqpClient);
     return d->heartbeatDelay;
 }
 
-void QAmqpClient::setHeartbeatDelay(qint16 delay)
+void QAmqpClient::setHeartbeatDelay(qint32 delay)
 {
     Q_D(QAmqpClient);
     if (d->connected) {
@@ -1105,7 +1104,12 @@ void QAmqpClient::setHeartbeatDelay(qint16 delay)
         return;
     }
 
-    d->heartbeatDelay = delay;
+    if (delay < 0 || delay > USHRT_MAX) {
+        qAmqpDebug() << Q_FUNC_INFO << "heartbeat delay must be in the range 0..65535";
+        return;
+    }
+
+    d->heartbeatDelay = quint16(delay);
 }
 
 qlonglong QAmqpClient::maxWriteQueueBytes() const

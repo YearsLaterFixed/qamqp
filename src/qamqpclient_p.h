@@ -55,7 +55,7 @@ public:
     quint16 allocateChannelNumber(int requestedChannelNumber);
     static quint16 negotiateChannelMax(quint16 clientChannelMax, quint16 serverChannelMax);
     static qint32 negotiateFrameMax(qint32 clientFrameMax, qint32 serverFrameMax);
-    static qint16 negotiateHeartbeat(qint16 clientHeartbeat, qint16 serverHeartbeat);
+    static quint16 negotiateHeartbeat(quint16 clientHeartbeat, quint16 serverHeartbeat);
     static QAmqpTable mergeClientProperties(const QAmqpTable &defaults,
                                              const QAmqpTable &custom);
     static bool validateDecodedFrame(const QAmqpFrame &frame,
@@ -127,7 +127,7 @@ public:
     QAmqpTable customProperties;
     quint16 channelMax;
     quint16 nextChannelNumber;
-    qint16 heartbeatDelay;
+    quint16 heartbeatDelay;
     qint32 frameMax;
 
     QAMQP::Error error;
