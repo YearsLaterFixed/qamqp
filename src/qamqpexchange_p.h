@@ -17,6 +17,8 @@ public:
         QAmqpTable headers;
         QAmqpMessage::PropertyHash properties;
         int publishOptions;
+        QByteArray encoded;
+        bool hasWriteReservation;
     };
 
     enum MethodId {
@@ -36,7 +38,8 @@ public:
     virtual void flowStateChanged(bool active);
 
     void declare();
-    void sendPublish(const PendingPublish &publish);
+    QAmqpExchange::PublishResult sendPublish(const PendingPublish &publish);
+    QByteArray serializePublish(const PendingPublish &publish) const;
     void flushPendingPublishes();
 
     // method handler related
