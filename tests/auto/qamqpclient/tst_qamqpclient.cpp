@@ -25,6 +25,7 @@ private Q_SLOTS:
     void frameMaxNegotiation();
     void heartbeatNegotiation_data();
     void heartbeatNegotiation();
+    void protocolMaximums();
     void channelAllocationLimit();
     void socketError();
     void invalidUri_data();
@@ -221,6 +222,9 @@ void tst_QAMQPClient::channelMaxNegotiation_data()
     QTest::newRow("server-unlimited") << quint16(10) << quint16(0) << quint16(10);
     QTest::newRow("client-lower") << quint16(10) << quint16(20) << quint16(10);
     QTest::newRow("server-lower") << quint16(20) << quint16(10) << quint16(10);
+    QTest::newRow("client-above-signed-range") << quint16(32768) << quint16(65535) << quint16(32768);
+    QTest::newRow("server-above-signed-range") << quint16(65535) << quint16(32768) << quint16(32768);
+    QTest::newRow("protocol-maximum") << quint16(65535) << quint16(65535) << quint16(65535);
 }
 
 void tst_QAMQPClient::channelMaxNegotiation()
@@ -257,25 +261,46 @@ void tst_QAMQPClient::frameMaxNegotiation()
 
 void tst_QAMQPClient::heartbeatNegotiation_data()
 {
-    QTest::addColumn<qint16>("clientHeartbeat");
-    QTest::addColumn<qint16>("serverHeartbeat");
-    QTest::addColumn<qint16>("expectedHeartbeat");
+    QTest::addColumn<quint16>("clientHeartbeat");
+    QTest::addColumn<quint16>("serverHeartbeat");
+    QTest::addColumn<quint16>("expectedHeartbeat");
 
-    QTest::newRow("both-disabled") << qint16(0) << qint16(0) << qint16(0);
-    QTest::newRow("client-disabled") << qint16(0) << qint16(60) << qint16(60);
-    QTest::newRow("server-disabled") << qint16(60) << qint16(0) << qint16(60);
-    QTest::newRow("client-lower") << qint16(30) << qint16(60) << qint16(30);
-    QTest::newRow("server-lower") << qint16(600) << qint16(60) << qint16(60);
-    QTest::newRow("negative-treated-as-disabled") << qint16(-1) << qint16(60) << qint16(60);
+    QTest::newRow("both-disabled") << quint16(0) << quint16(0) << quint16(0);
+    QTest::newRow("client-disabled") << quint16(0) << quint16(60) << quint16(60);
+    QTest::newRow("server-disabled") << quint16(60) << quint16(0) << quint16(60);
+    QTest::newRow("client-lower") << quint16(30) << quint16(60) << quint16(30);
+    QTest::newRow("server-lower") << quint16(600) << quint16(60) << quint16(60);
+    QTest::newRow("client-above-signed-range") << quint16(32768) << quint16(65535) << quint16(32768);
+    QTest::newRow("server-above-signed-range") << quint16(65535) << quint16(32768) << quint16(32768);
+    QTest::newRow("protocol-maximum") << quint16(65535) << quint16(65535) << quint16(65535);
 }
 
 void tst_QAMQPClient::heartbeatNegotiation()
 {
-    QFETCH(qint16, clientHeartbeat);
-    QFETCH(qint16, serverHeartbeat);
-    QFETCH(qint16, expectedHeartbeat);
+    QFETCH(quint16, clientHeartbeat);
+    QFETCH(quint16, serverHeartbeat);
+    QFETCH(quint16, expectedHeartbeat);
 
     QCOMPARE(QAmqpClientPrivate::negotiateHeartbeat(clientHeartbeat, serverHeartbeat), expectedHeartbeat);
+}
+
+void tst_QAMQPClient::protocolMaximums()
+{
+    QAmqpClient client;
+    client.setChannelMax(65535);
+    client.setHeartbeatDelay(65535);
+    QCOMPARE(client.channelMax(), qint32(65535));
+    QCOMPARE(client.heartbeatDelay(), qint32(65535));
+
+    client.setChannelMax(-1);
+    client.setHeartbeatDelay(-1);
+    QCOMPARE(client.channelMax(), qint32(65535));
+    QCOMPARE(client.heartbeatDelay(), qint32(65535));
+
+    client.setChannelMax(65536);
+    client.setHeartbeatDelay(65536);
+    QCOMPARE(client.channelMax(), qint32(65535));
+    QCOMPARE(client.heartbeatDelay(), qint32(65535));
 }
 
 void tst_QAMQPClient::channelAllocationLimit()
