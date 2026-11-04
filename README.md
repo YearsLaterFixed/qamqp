@@ -27,6 +27,18 @@ A good starting point is:
 * Start the "receive" sample and see in your browser the "hello" queue appear
 * publish a message there
 
+Build and install with CMake (QAMQP 1.0.0 and later):
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local
+cmake --build build
+cmake --install build
+```
+
+Consumers can use `find_package(QAMQP CONFIG REQUIRED)` and link the exported
+`QAMQP::qamqp` target. Qt Core and Network are propagated as target dependencies.
+The legacy qmake project remains supported.
+
 Usage notes
 ------------
 
