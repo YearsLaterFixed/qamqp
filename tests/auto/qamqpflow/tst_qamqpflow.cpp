@@ -55,6 +55,12 @@ private Q_SLOTS:
     void incomingFrameLimitIncludesOverhead();
     void deferredFramingFailureIsObservable();
     void immediateWriterFailureDoesNotRetainReservation();
+    void silentPeerExpiresNegotiatedHeartbeat();
+    void inboundTrafficKeepsHeartbeatAlive_data();
+    void inboundTrafficKeepsHeartbeatAlive();
+    void zeroHeartbeatDisablesWatchdog();
+    void disconnectStopsHeartbeatTimers();
+    void heartbeatTimeoutReconnectsOnce();
     void clientDestructionWithDeferredPublishes();
     void writeQueueReservation();
     void asynchronousWriteQueue();
@@ -677,6 +683,226 @@ void tst_QAMQPFlow::immediateWriterFailureDoesNotRetainReservation()
     QCOMPARE(exchangeState->pendingPublishBytes, qint64(0));
     QCOMPARE(client.bufferedWriteBytes(), qlonglong(0));
     QCOMPARE(exchange->cancelPendingPublishes(), 0);
+}
+
+void tst_QAMQPFlow::silentPeerExpiresNegotiatedHeartbeat()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QVERIFY(connectControlWriter(client, server));
+    writer.connected = true;
+    client.setAutoReconnect(true, 1000);
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    QSignalSpy disconnected(&client, &QAmqpClient::disconnected);
+    QAmqpMethodFrame tune(QAmqpFrame::Connection, QAmqpClientPrivate::miTune);
+    QByteArray arguments;
+    QDataStream stream(&arguments, QIODevice::WriteOnly);
+    stream << quint16(16) << quint32(4096) << quint16(1);
+    tune.setArguments(arguments);
+    writer.tune(tune);
+    QTRY_COMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(disconnected.count(), 1);
+    QVERIFY(client.errorString().contains("heartbeat", Qt::CaseInsensitive));
+    QVERIFY(writer.reconnectTimer->isActive());
+    writer.reconnectTimer->stop();
+}
+
+static QAmqpMethodFrame heartbeatTune(quint16 seconds)
+{
+    QAmqpMethodFrame tune(QAmqpFrame::Connection, QAmqpClientPrivate::miTune);
+    QByteArray arguments;
+    QDataStream stream(&arguments, QIODevice::WriteOnly);
+    stream << quint16(16) << quint32(4096) << seconds;
+    tune.setArguments(arguments);
+    return tune;
+}
+
+class HeartbeatTrafficProbe : public QAmqpMethodFrameHandler
+{
+public:
+    HeartbeatTrafficProbe() : calls(0) {}
+    bool _q_method(const QAmqpMethodFrame &) override { ++calls; return true; }
+    int calls;
+};
+
+void tst_QAMQPFlow::inboundTrafficKeepsHeartbeatAlive_data()
+{
+    QTest::addColumn<bool>("heartbeatFrames");
+    QTest::newRow("ordinary-method-traffic") << false;
+    QTest::newRow("heartbeat-traffic") << true;
+}
+
+void tst_QAMQPFlow::inboundTrafficKeepsHeartbeatAlive()
+{
+    QFETCH(bool, heartbeatFrames);
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    writer.connected = true;
+    HeartbeatTrafficProbe probe;
+    writer.methodHandlersByChannel[1].append(&probe);
+    QObject::connect(writer.socket, &QIODevice::readyRead, &client, [&writer] { writer._q_readyRead(); });
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    QSignalSpy heartbeats(&client, &QAmqpClient::heartbeat);
+    writer.tune(heartbeatTune(1));
+    QCOMPARE(writer.heartbeatTimer->interval(), 500);
+    QAmqpMethodFrame method(QAmqpFrame::Basic, QAmqpChannelPrivate::bmQosOk);
+    method.setChannel(1);
+    QAmqpHeartbeatFrame heartbeat;
+    const QByteArray activity = heartbeatFrames ? encodeFrame(heartbeat) : encodeFrame(method);
+    QTimer traffic;
+    QObject::connect(&traffic, &QTimer::timeout, &client, [peer, activity] {
+        peer->write(activity);
+        peer->flush();
+    });
+    traffic.start(100);
+    bool observedActivePeriod = false;
+    QTimer::singleShot(1500, &client, [&observedActivePeriod] { observedActivePeriod = true; });
+    QTRY_VERIFY(observedActivePeriod);
+    QCOMPARE(errors.count(), 0);
+    QCOMPARE(writer.socket->state(), QAbstractSocket::ConnectedState);
+    QVERIFY(heartbeatFrames ? heartbeats.count() > 0 : probe.calls > 0);
+    traffic.stop();
+    QTRY_COMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(!writer.heartbeatTimer->isActive());
+    QVERIFY(!writer.receiveHeartbeatTimer->isActive());
+    QVERIFY(!writer.lastReceived.isValid());
+    QVERIFY(!writer.reconnectTimer->isActive());
+    for (int attempt = 0; attempt < 4; ++attempt)
+        writer._q_checkHeartbeat();
+    QCOMPARE(errors.count(), 1);
+}
+
+void tst_QAMQPFlow::zeroHeartbeatDisablesWatchdog()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QVERIFY(connectControlWriter(client, server));
+    writer.connected = true;
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    writer.tune(heartbeatTune(1));
+    QVERIFY(writer.receiveHeartbeatTimer->isActive());
+    writer.heartbeatDelay = 0;
+    writer.tune(heartbeatTune(0));
+    QVERIFY(!writer.heartbeatTimer->isActive());
+    QVERIFY(!writer.receiveHeartbeatTimer->isActive());
+    QVERIFY(!writer.lastReceived.isValid());
+    bool observedSilentPeriod = false;
+    QTimer::singleShot(1200, &client, [&observedSilentPeriod] { observedSilentPeriod = true; });
+    QTRY_VERIFY(observedSilentPeriod);
+    writer._q_checkHeartbeat();
+    QCOMPARE(errors.count(), 0);
+    QCOMPARE(writer.socket->state(), QAbstractSocket::ConnectedState);
+}
+
+void tst_QAMQPFlow::disconnectStopsHeartbeatTimers()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    writer.connected = true;
+    writer.tune(heartbeatTune(1));
+    peer->abort();
+    QTRY_COMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+    QVERIFY(!writer.heartbeatTimer->isActive());
+    QVERIFY(!writer.receiveHeartbeatTimer->isActive());
+    QVERIFY(!writer.lastReceived.isValid());
+    peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+    writer.connected = true;
+    writer.tune(heartbeatTune(1));
+    writer.closed = true;
+    writer._q_checkHeartbeat();
+    QVERIFY(!writer.heartbeatTimer->isActive());
+    QVERIFY(!writer.receiveHeartbeatTimer->isActive());
+    QVERIFY(!writer.lastReceived.isValid());
+    writer.closed = false;
+    writer.tune(heartbeatTune(1));
+    writer._q_disconnect();
+    QVERIFY(!writer.heartbeatTimer->isActive());
+    QVERIFY(!writer.receiveHeartbeatTimer->isActive());
+    QVERIFY(!writer.lastReceived.isValid());
+    writer.socket->abort();
+}
+
+void tst_QAMQPFlow::heartbeatTimeoutReconnectsOnce()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+    ControlTestClient client;
+    client.setHost("127.0.0.1");
+    client.setPort(server.serverPort());
+    client.setAutoReconnect(true, 50);
+    QAmqpClientPrivate &writer = *client.state();
+    QSignalSpy connected(&client, &QAmqpClient::connected);
+    QSignalSpy disconnected(&client, &QAmqpClient::disconnected);
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    int connections = 0;
+    QPointer<QTcpSocket> responsivePeer;
+    QTimer traffic;
+    QObject::connect(&traffic, &QTimer::timeout, &client, [&responsivePeer] {
+        if (responsivePeer) {
+            QAmqpHeartbeatFrame heartbeat;
+            responsivePeer->write(encodeFrame(heartbeat));
+            responsivePeer->flush();
+        }
+    });
+    QObject::connect(&server, &QTcpServer::newConnection, &client, [&] {
+        QTcpSocket *peer = server.nextPendingConnection();
+        ++connections;
+        QAmqpMethodFrame openOk(QAmqpFrame::Connection, QAmqpClientPrivate::miOpenOk);
+        openOk.setArguments(QByteArray(1, char(0)));
+        peer->write(encodeFrame(heartbeatTune(1)) + encodeFrame(openOk));
+        peer->flush();
+        if (connections > 1) {
+            responsivePeer = peer;
+            traffic.start(100);
+        }
+    });
+    client.connectToHost();
+    QTRY_COMPARE(connected.count(), 2);
+    QCOMPARE(connections, 2);
+    QCOMPARE(disconnected.count(), 1);
+    QCOMPARE(errors.count(), 1);
+    QVERIFY(client.isConnected());
+    QVERIFY(!writer.reconnectTimer->isActive());
+    QVERIFY(writer.receiveHeartbeatTimer->isActive());
+    bool observedRecoveredPeriod = false;
+    QTimer::singleShot(1500, &client, [&observedRecoveredPeriod] { observedRecoveredPeriod = true; });
+    QTRY_VERIFY(observedRecoveredPeriod);
+    QCOMPARE(connections, 2);
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(connected.count(), 2);
+    client.setAutoReconnect(false);
+    traffic.stop();
+    client.abort();
+    QTRY_COMPARE(disconnected.count(), 2);
+    QVERIFY(!writer.receiveHeartbeatTimer->isActive());
+    QVERIFY(!writer.lastReceived.isValid());
+    QVERIFY(!writer.reconnectTimer->isActive());
 }
 
 void tst_QAMQPFlow::controlFramesRespectPublishSequence()

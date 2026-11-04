@@ -6,6 +6,7 @@
 #include <QPointer>
 #include <QQueue>
 #include <QSet>
+#include <QElapsedTimer>
 #include <QAbstractSocket>
 #include <QSslError>
 
@@ -75,6 +76,8 @@ public:
     void _q_readyRead();
     void _q_socketError(QAbstractSocket::SocketError error);
     void _q_heartbeat();
+    void _q_checkHeartbeat();
+    void stopHeartbeatTimers();
     virtual void _q_connect();
     void _q_disconnect();
 
@@ -142,6 +145,8 @@ public:
     bool closed;
     bool connected;
     QPointer<QTimer> heartbeatTimer;
+    QPointer<QTimer> receiveHeartbeatTimer;
+    QElapsedTimer lastReceived;
     QPointer<QTimer> controlWriteTimer;
     QPointer<QTimer> reconnectTimer;
     QAmqpTable customProperties;
