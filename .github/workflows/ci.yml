@@ -51,7 +51,7 @@ jobs:
           done
           client_dir=tests/auto/qamqpclient
           (cd "$client_dir" && qmake qamqpclient.pro && make -j2)
-          for test in channelMaxNegotiation heartbeatNegotiation; do
+          for test in channelMaxNegotiation heartbeatNegotiation frameMaxNegotiation protocolMaximums clientPropertiesMerge writeQueueReservation channelAllocationLimit; do
             (cd "$client_dir" && ./tst_qamqpclient "$test")
           done
 

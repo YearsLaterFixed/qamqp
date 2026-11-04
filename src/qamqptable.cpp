@@ -206,7 +206,8 @@ void QAmqpTable::writeFieldValue(QDataStream &stream, QAmqpMetaType::ValueType t
     case QAmqpMetaType::LongString:
     case QAmqpMetaType::Timestamp:
     case QAmqpMetaType::Hash:
-        return QAmqpFrame::writeAmqpField(stream, type, value);
+        QAmqpFrame::writeAmqpField(stream, type, value);
+        return;
 
     case QAmqpMetaType::ShortShortInt:
         stream << qint8(value.toInt());
@@ -252,6 +253,10 @@ void QAmqpTable::writeFieldValue(QDataStream &stream, QAmqpMetaType::ValueType t
         QVariantList array(value.toList());
         for (int i = 0; i < array.size(); ++i)
             writeFieldValue(arrayStream, array.at(i));
+        if (arrayStream.status() != QDataStream::Ok) {
+            stream.setStatus(arrayStream.status());
+            return;
+        }
 
         if (buffer.isEmpty()) {
             stream << qint32(0);
@@ -396,6 +401,10 @@ QDataStream &operator<<(QDataStream &stream, const QAmqpTable &table)
     for (it = table.constBegin(); it != itEnd; ++it) {
         QAmqpTable::writeFieldValue(s, QAmqpMetaType::ShortString, it.key());
         QAmqpTable::writeFieldValue(s, it.value());
+        if (s.status() != QDataStream::Ok) {
+            stream.setStatus(s.status());
+            return stream;
+        }
     }
 
     if (data.isEmpty()) {

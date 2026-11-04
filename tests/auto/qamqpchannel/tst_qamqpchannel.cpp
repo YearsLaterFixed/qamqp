@@ -80,7 +80,8 @@ void tst_QAMQPChannel::sharedChannel()
     declareQueueAndVerifyConsuming(queue);
 
     QAmqpExchange *defaultExchange = client->createExchange("", queue->channelNumber());
-    defaultExchange->publish("first message", routingKey);
+    QCOMPARE(defaultExchange->publish("first message", routingKey),
+             QAmqpExchange::AcceptedForWrite);
     QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
     QAmqpMessage message = queue->dequeue();
     verifyStandardMessageHeaders(message, routingKey);

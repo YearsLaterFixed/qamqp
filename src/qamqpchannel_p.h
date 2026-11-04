@@ -40,6 +40,8 @@ public:
 
     void init(int channel, QAmqpClient *client);
     void sendFrame(const QAmqpFrame &frame);
+    bool sendFrameBatch(const QByteArray &data, qint64 reservedBytes);
+    bool reserveWriteBytes(qint64 bytes);
     virtual void resetInternalState();
 
     void open();

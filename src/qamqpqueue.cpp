@@ -20,7 +20,14 @@ QAmqpQueuePrivate::QAmqpQueuePrivate(QAmqpQueue *q)
       consuming(false),
       consumeRequested(false),
       messageCount(0),
-      consumerCount(0)
+    consumerCount(0),
+    bufferedBytes(0),
+    maxBufferedMessages(0),
+    maxBufferedBytes(0),
+    maxMessageSize(AMQP_MESSAGE_MAX),
+    discardingMessage(false),
+    discardReason(QAmqpQueue::MessageSizeLimitExceeded),
+    discardedDeliveryTag(0)
 {
 }
 
@@ -40,6 +47,9 @@ void QAmqpQueuePrivate::resetInternalState()
     delayedDeclare = false;
     declared = false;
     recievingMessage = false;
+    currentMessage = QAmqpMessage();
+    discardingMessage = false;
+    discardedDeliveryTag = 0;
     consuming = false;
     consumeRequested = false;
 }
@@ -52,6 +62,38 @@ bool QAmqpQueuePrivate::isAcceptableBodySize(qlonglong declaredBodySize)
 bool QAmqpQueuePrivate::isAcceptableBodyChunk(qlonglong remainingSize, qlonglong chunkSize)
 {
     return chunkSize >= 0 && chunkSize <= remainingSize;
+}
+
+QAmqpQueue::OverflowReason QAmqpQueuePrivate::overflowReason(
+    int bufferedCount, qlonglong bufferedBytes, qlonglong declaredBodySize,
+    int maxBufferedMessages, qlonglong maxBufferedBytes, qlonglong maxMessageSize)
+{
+    if (maxMessageSize > 0 && declaredBodySize > maxMessageSize)
+        return QAmqpQueue::MessageSizeLimitExceeded;
+    if (maxBufferedMessages > 0 && bufferedCount >= maxBufferedMessages)
+        return QAmqpQueue::BufferedMessageCountLimitExceeded;
+    if (maxBufferedBytes > 0 && declaredBodySize > maxBufferedBytes - bufferedBytes)
+        return QAmqpQueue::BufferedByteLimitExceeded;
+    return QAmqpQueue::NoOverflow;
+}
+
+void QAmqpQueuePrivate::enqueueMessage(const QAmqpMessage &message)
+{
+    messages.enqueue(message);
+    bufferedBytes += message.payload().size();
+}
+
+QAmqpMessage QAmqpQueuePrivate::dequeueMessage()
+{
+    QAmqpMessage message = messages.dequeue();
+    bufferedBytes -= message.payload().size();
+    return message;
+}
+
+void QAmqpQueuePrivate::clearMessages()
+{
+    messages.clear();
+    bufferedBytes = 0;
 }
 
 bool QAmqpQueuePrivate::_q_method(const QAmqpMethodFrame &frame)
@@ -76,7 +118,7 @@ bool QAmqpQueuePrivate::_q_method(const QAmqpMethodFrame &frame)
             break;
         case miPurgeOk:
             purgeOk(frame);
-            break;
+            qRegisterMetaType<QAmqpQueue::OverflowReason>("QAmqpQueue::OverflowReason");
         }
 
         return true;
@@ -122,11 +164,29 @@ void QAmqpQueuePrivate::_q_content(const QAmqpContentFrame &frame)
     if (!isAcceptableBodySize(frame.bodySize())) {
         qAmqpDebug() << Q_FUNC_INFO << "rejecting message, declared body size out of range:"
                      << frame.bodySize();
+        if (frame.bodySize() > AMQP_MESSAGE_MAX && currentMessage.isValid() && q)
+            Q_EMIT q->messageDiscarded(currentMessage.d->deliveryTag,
+                                        QAmqpQueue::MessageSizeLimitExceeded);
         currentMessage = QAmqpMessage();
         return;
     }
 
     currentMessage.d->leftSize = frame.bodySize();
+    discardReason = overflowReason(messages.size(), bufferedBytes, frame.bodySize(),
+                                   maxBufferedMessages, maxBufferedBytes, maxMessageSize);
+    if (int(discardReason) >= 0) {
+        discardingMessage = true;
+        discardedDeliveryTag = currentMessage.d->deliveryTag;
+        if (q)
+            Q_EMIT q->messageDiscarded(discardedDeliveryTag, discardReason);
+        if (currentMessage.d->leftSize == 0) {
+            currentMessage = QAmqpMessage();
+            discardingMessage = false;
+            discardedDeliveryTag = 0;
+        }
+        return;
+    }
+
     QAmqpMessage::PropertyHash::ConstIterator it;
     QAmqpMessage::PropertyHash::ConstIterator itEnd = frame.properties_.constEnd();
     for (it = frame.properties_.constBegin(); it != itEnd; ++it) {
@@ -138,8 +198,10 @@ void QAmqpQueuePrivate::_q_content(const QAmqpContentFrame &frame)
 
     if (currentMessage.d->leftSize == 0) {
         // message with an empty body
-        q->enqueue(currentMessage);
-        Q_EMIT q->messageReceived();
+        enqueueMessage(currentMessage);
+        currentMessage = QAmqpMessage();
+        if (q)
+            Q_EMIT q->messageReceived();
     }
 }
 
@@ -155,6 +217,22 @@ void QAmqpQueuePrivate::_q_body(const QAmqpContentBodyFrame &frame)
         return;
     }
 
+    if (discardingMessage) {
+        if (!isAcceptableBodyChunk(currentMessage.d->leftSize, frame.body().size())) {
+            currentMessage = QAmqpMessage();
+            discardingMessage = false;
+            discardedDeliveryTag = 0;
+            return;
+        }
+        currentMessage.d->leftSize -= frame.body().size();
+        if (currentMessage.d->leftSize == 0) {
+            currentMessage = QAmqpMessage();
+            discardingMessage = false;
+            discardedDeliveryTag = 0;
+        }
+        return;
+    }
+
     if (!isAcceptableBodyChunk(currentMessage.d->leftSize, frame.body().size())) {
         qAmqpDebug() << Q_FUNC_INFO << "discarding message, body frame overruns declared size";
         currentMessage = QAmqpMessage();
@@ -164,8 +242,10 @@ void QAmqpQueuePrivate::_q_body(const QAmqpContentBodyFrame &frame)
     currentMessage.d->payload.append(frame.body());
     currentMessage.d->leftSize -= frame.body().size();
     if (currentMessage.d->leftSize == 0) {
-        q->enqueue(currentMessage);
-        Q_EMIT q->messageReceived();
+        enqueueMessage(currentMessage);
+        currentMessage = QAmqpMessage();
+        if (q)
+            Q_EMIT q->messageReceived();
     }
 }
 
@@ -302,7 +382,7 @@ void QAmqpQueuePrivate::declare()
                options & QAmqpQueue::Exclusive, options & QAmqpQueue::AutoDelete,
                options & QAmqpQueue::NoWait);
 
-    frame.setArguments(args);
+    frame.setArguments(args, out.status());
     sendFrame(frame);
 
     if (delayedDeclare)
@@ -377,6 +457,84 @@ qint32 QAmqpQueue::consumerCount() const
     return d->consumerCount;
 }
 
+int QAmqpQueue::maxBufferedMessages() const
+{
+    Q_D(const QAmqpQueue);
+    return d->maxBufferedMessages;
+}
+
+void QAmqpQueue::setMaxBufferedMessages(int maximum)
+{
+    Q_D(QAmqpQueue);
+    d->maxBufferedMessages = qMax(0, maximum);
+}
+
+qlonglong QAmqpQueue::maxBufferedBytes() const
+{
+    Q_D(const QAmqpQueue);
+    return d->maxBufferedBytes;
+}
+
+void QAmqpQueue::setMaxBufferedBytes(qlonglong maximum)
+{
+    Q_D(QAmqpQueue);
+    d->maxBufferedBytes = qMax(qlonglong(0), maximum);
+}
+
+qlonglong QAmqpQueue::maxMessageSize() const
+{
+    Q_D(const QAmqpQueue);
+    return d->maxMessageSize;
+}
+
+void QAmqpQueue::setMaxMessageSize(qlonglong maximum)
+{
+    Q_D(QAmqpQueue);
+    d->maxMessageSize = qMax(qlonglong(0), maximum);
+}
+
+int QAmqpQueue::bufferedMessageCount() const
+{
+    Q_D(const QAmqpQueue);
+    return d->messages.size() + (d->currentMessage.isValid() ? 1 : 0);
+}
+
+qlonglong QAmqpQueue::bufferedMessageBytes() const
+{
+    Q_D(const QAmqpQueue);
+    return d->bufferedBytes + d->currentMessage.payload().size();
+}
+
+int QAmqpQueue::size() const
+{
+    Q_D(const QAmqpQueue);
+    return d->messages.size();
+}
+
+bool QAmqpQueue::isEmpty() const
+{
+    Q_D(const QAmqpQueue);
+    return d->messages.isEmpty();
+}
+
+QAmqpMessage QAmqpQueue::head() const
+{
+    Q_D(const QAmqpQueue);
+    return d->messages.head();
+}
+
+QAmqpMessage QAmqpQueue::dequeue()
+{
+    Q_D(QAmqpQueue);
+    return d->dequeueMessage();
+}
+
+void QAmqpQueue::clear()
+{
+    Q_D(QAmqpQueue);
+    d->clearMessages();
+}
+
 void QAmqpQueue::declare(int options, const QAmqpTable &arguments)
 {
     Q_D(QAmqpQueue);
@@ -412,7 +570,7 @@ void QAmqpQueue::remove(int options)
     qAmqpDebug("<- queue#delete( queue=%s, if-unused=%d, if-empty=%d )",
                qPrintable(d->name), options & QAmqpQueue::roIfUnused, options & QAmqpQueue::roIfEmpty);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -434,7 +592,7 @@ void QAmqpQueue::purge()
 
     qAmqpDebug("<- queue#purge( queue=%s, no-wait=%d )", qPrintable(d->name), 0);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -491,7 +649,7 @@ void QAmqpQueue::bind(const QString &exchangeName, const QString &key, bool noWa
                qPrintable(d->name), qPrintable(exchangeName), qPrintable(key),
                noWait);
 
-    frame.setArguments(frameArguments);
+    frame.setArguments(frameArguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -527,7 +685,7 @@ void QAmqpQueue::unbind(const QString &exchangeName, const QString &key)
     qAmqpDebug("<- queue#unbind( queue=%s, exchange=%s, routing-key=%s )",
                qPrintable(d->name), qPrintable(exchangeName), qPrintable(key));
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -567,7 +725,7 @@ bool QAmqpQueue::consume(int options)
                options & QAmqpQueue::coNoLocal, options & QAmqpQueue::coNoAck,
                options & QAmqpQueue::coExclusive, options & QAmqpQueue::coNoWait);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
     d->consumeRequested = true;
     return true;
@@ -617,7 +775,7 @@ void QAmqpQueue::get(bool noAck)
 
     qAmqpDebug("<- basic#get( queue=%s, no-ack=%d )", qPrintable(d->name), noAck);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -701,7 +859,7 @@ bool QAmqpQueue::cancel(bool noWait)
 
     qAmqpDebug("<- basic#cancel( consumer-tag=%s, no-wait=%d )", qPrintable(d->consumerTag), noWait);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
     return true;
 }

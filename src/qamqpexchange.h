@@ -50,6 +50,20 @@ public:
     };
     Q_DECLARE_FLAGS(PublishOptions, PublishOption)
 
+    enum PublishError {
+        InvalidShortString
+    };
+    Q_ENUM(PublishError)
+
+    enum PublishResult {
+        AcceptedForWrite,
+        Queued,
+        RejectedLimit,
+        NotConnected,
+        RejectedInvalid
+    };
+    Q_ENUM(PublishResult)
+
     enum RemoveOption {
         roForce = 0x0,
         roIfUnused = 0x01,
@@ -80,6 +94,7 @@ Q_SIGNALS:
 
     void confirmsEnabled();
     void allMessagesDelivered();
+    void publishRejected(QAmqpExchange::PublishError error);
 
 public Q_SLOTS:
     // AMQP Exchange
@@ -92,16 +107,16 @@ public Q_SLOTS:
     void remove(int options = roIfUnused|roNoWait);
 
     // AMQP Basic
-    void publish(const QString &message, const QString &routingKey,
-                 const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
-                 int publishOptions = poNoOptions);
-    void publish(const QByteArray &message, const QString &routingKey, const QString &mimeType,
-                 const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
-                 int publishOptions = poNoOptions);
-    void publish(const QByteArray &message, const QString &routingKey,
-                 const QString &mimeType, const QAmqpTable &headers,
-                 const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
-                 int publishOptions = poNoOptions);
+    PublishResult publish(const QString &message, const QString &routingKey,
+                          const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
+                          int publishOptions = poNoOptions);
+    PublishResult publish(const QByteArray &message, const QString &routingKey, const QString &mimeType,
+                          const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
+                          int publishOptions = poNoOptions);
+    PublishResult publish(const QByteArray &message, const QString &routingKey,
+                          const QString &mimeType, const QAmqpTable &headers,
+                          const QAmqpMessage::PropertyHash &properties = QAmqpMessage::PropertyHash(),
+                          int publishOptions = poNoOptions);
 
 protected:
     virtual void channelOpened();
@@ -119,5 +134,6 @@ private:
 
 Q_DECLARE_OPERATORS_FOR_FLAGS(QAmqpExchange::ExchangeOptions)
 Q_DECLARE_METATYPE(QAmqpExchange::ExchangeType)
+Q_DECLARE_METATYPE(QAmqpExchange::PublishError)
 
 #endif // QAMQPEXCHANGE_H

@@ -65,12 +65,20 @@ void QAmqpFrame::readEnd(QDataStream &stream)
 
 QDataStream &operator<<(QDataStream &stream, const QAmqpFrame &frame)
 {
+    const qint32 payloadSize = frame.size();
+    if (payloadSize < 0) {
+        stream.setStatus(QDataStream::WriteFailed);
+        return stream;
+    }
+
     // write header
     stream << frame.type_;
     stream << frame.channel_;
-    stream << frame.size();
+    stream << payloadSize;
 
     frame.writePayload(stream);
+    if (stream.status() != QDataStream::Ok)
+        return stream;
 
     // write end
     stream << qint8(QAmqpFrame::FRAME_END);
@@ -86,7 +94,11 @@ QDataStream &operator>>(QDataStream &stream, QAmqpFrame &frame)
     stream >> frame.type_;
     stream >> frame.channel_;
     stream >> frame.size_;
+    const qint64 payloadStart = stream.device()->pos();
     frame.readPayload(stream);
+    if (stream.status() == QDataStream::Ok &&
+        stream.device()->pos() - payloadStart != frame.size_)
+        stream.setStatus(QDataStream::ReadCorruptData);
     return stream;
 }
 
@@ -95,14 +107,16 @@ QDataStream &operator>>(QDataStream &stream, QAmqpFrame &frame)
 QAmqpMethodFrame::QAmqpMethodFrame()
     : QAmqpFrame(QAmqpFrame::Method),
       methodClass_(0),
-      id_(0)
+    id_(0),
+    argumentsValid_(true)
 {
 }
 
 QAmqpMethodFrame::QAmqpMethodFrame(MethodClass methodClass, qint16 id)
     : QAmqpFrame(QAmqpFrame::Method),
       methodClass_(methodClass),
-      id_(id)
+    id_(id),
+    argumentsValid_(true)
 {
 }
 
@@ -118,12 +132,13 @@ qint16 QAmqpMethodFrame::id() const
 
 qint32 QAmqpMethodFrame::size() const
 {
-    return sizeof(id_) + sizeof(methodClass_) + arguments_.size();
+    return argumentsValid_ ? sizeof(id_) + sizeof(methodClass_) + arguments_.size() : -1;
 }
 
-void QAmqpMethodFrame::setArguments(const QByteArray &data)
+void QAmqpMethodFrame::setArguments(const QByteArray &data, QDataStream::Status status)
 {
     arguments_ = data;
+    argumentsValid_ = status == QDataStream::Ok;
 }
 
 QByteArray QAmqpMethodFrame::arguments() const
@@ -148,10 +163,15 @@ void QAmqpMethodFrame::readPayload(QDataStream &stream)
 
     arguments_.resize(size_ - headerSize);
     stream.readRawData(arguments_.data(), arguments_.size());
+    argumentsValid_ = stream.status() == QDataStream::Ok;
 }
 
 void QAmqpMethodFrame::writePayload(QDataStream &stream) const
 {
+    if (!argumentsValid_) {
+        stream.setStatus(QDataStream::WriteFailed);
+        return;
+    }
     stream << quint16(methodClass_);
     stream << quint16(id_);
     stream.writeRawData(arguments_.data(), arguments_.size());
@@ -259,8 +279,17 @@ QVariant QAmqpFrame::readAmqpField(QDataStream &s, QAmqpMetaType::ValueType type
     return QVariant();
 }
 
-void QAmqpFrame::writeAmqpField(QDataStream &s, QAmqpMetaType::ValueType type, const QVariant &value)
+bool QAmqpFrame::isValidShortString(const QString &value)
 {
+    return value.toUtf8().size() <= 255;
+}
+
+bool QAmqpFrame::writeAmqpField(QDataStream &s, QAmqpMetaType::ValueType type,
+                                 const QVariant &value)
+{
+    if (s.status() != QDataStream::Ok)
+        return false;
+
     switch (type) {
     case QAmqpMetaType::Boolean:
         s << (value.toBool() ? qint8(1) : qint8(0));
@@ -281,8 +310,9 @@ void QAmqpFrame::writeAmqpField(QDataStream &s, QAmqpMetaType::ValueType type, c
     {
         QByteArray bytes = value.toString().toUtf8();
         if (bytes.length() > 255) {
-            qAmqpDebug() << Q_FUNC_INFO << "shortstr exceeds 255 bytes, truncating: " << bytes.length();
-            bytes.truncate(255);
+            qAmqpDebug() << Q_FUNC_INFO << "shortstr exceeds 255 bytes: " << bytes.length();
+            s.setStatus(QDataStream::WriteFailed);
+            return false;
         }
 
         s << quint8(bytes.length());
@@ -311,18 +341,24 @@ void QAmqpFrame::writeAmqpField(QDataStream &s, QAmqpMetaType::ValueType type, c
         break;
     default:
         qAmqpDebug() << Q_FUNC_INFO << "unsupported value type: " << type;
+        s.setStatus(QDataStream::WriteFailed);
+        return false;
     }
+
+    return s.status() == QDataStream::Ok;
 }
 
 //////////////////////////////////////////////////////////////////////////
 
 QAmqpContentFrame::QAmqpContentFrame()
-    : QAmqpFrame(QAmqpFrame::Header)
+        : QAmqpFrame(QAmqpFrame::Header),
+            serializationValid_(true)
 {
 }
 
 QAmqpContentFrame::QAmqpContentFrame(QAmqpFrame::MethodClass methodClass)
-    : QAmqpFrame(QAmqpFrame::Header)
+        : QAmqpFrame(QAmqpFrame::Header),
+            serializationValid_(true)
 {
     methodClass_ = methodClass;
 }
@@ -334,6 +370,7 @@ QAmqpFrame::MethodClass QAmqpContentFrame::methodClass() const
 
 qint32 QAmqpContentFrame::size() const
 {
+    serializationValid_ = false;
     QDataStream out(&buffer_, QIODevice::WriteOnly);
     buffer_.clear();
     out << qint16(methodClass_);
@@ -387,6 +424,11 @@ qint32 QAmqpContentFrame::size() const
     if (prop_ & QAmqpMessage::ClusterID)
         writeAmqpField(out, QAmqpMetaType::ShortString, properties_[QAmqpMessage::ClusterID]);
 
+    if (out.status() != QDataStream::Ok)
+        return -1;
+
+    serializationValid_ = true;
+
     return buffer_.size();
 }
 
@@ -418,10 +460,17 @@ void QAmqpContentFrame::writePayload(QDataStream &out) const
 void QAmqpContentFrame::readPayload(QDataStream &in)
 {
     in >> methodClass_;
-    in.skipRawData(2); //weight
+    qint16 weight = 0;
+    in >> weight;
     in >> bodySize_;
-    qint16 flags_ = 0;
+    quint16 flags_ = 0;
     in >> flags_;
+    if (in.status() != QDataStream::Ok || weight != 0 || bodySize_ < 0 ||
+        (flags_ & quint16(0x0003)) != 0) {
+        in.setStatus(QDataStream::ReadCorruptData);
+        return;
+    }
+
     if (flags_ & QAmqpMessage::ContentType)
         properties_[QAmqpMessage::ContentType] = readAmqpField(in, QAmqpMetaType::ShortString);
 

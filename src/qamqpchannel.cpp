@@ -35,6 +35,18 @@ void QAmqpChannelPrivate::init(int channel, QAmqpClient *c)
     const quint16 previousChannelNumber = clientPriv->nextChannelNumber;
     channelNumber = clientPriv->allocateChannelNumber(channel);
     needOpen = channelNumber && (channel == -1 || channel > previousChannelNumber);
+    if (!needOpen && channelNumber) {
+        const QList<QAmqpMethodFrameHandler *> handlers =
+            clientPriv->methodHandlersByChannel.value(channelNumber);
+        foreach (QAmqpMethodFrameHandler *handler, handlers) {
+            QAmqpChannelPrivate *sharedChannel = dynamic_cast<QAmqpChannelPrivate *>(handler);
+            if (sharedChannel && sharedChannel->opened) {
+                opened = true;
+                flowActive = sharedChannel->flowActive;
+                break;
+            }
+        }
+    }
 }
 
 bool QAmqpChannelPrivate::_q_method(const QAmqpMethodFrame &frame)
@@ -91,6 +103,21 @@ void QAmqpChannelPrivate::sendFrame(const QAmqpFrame &frame)
     client->d_func()->sendFrame(frame);
 }
 
+bool QAmqpChannelPrivate::sendFrameBatch(const QByteArray &data, qint64 reservedBytes)
+{
+    if (!client) {
+        qAmqpDebug() << Q_FUNC_INFO << "invalid client";
+        return false;
+    }
+
+    return client->d_func()->sendFrameBatch(data, reservedBytes);
+}
+
+bool QAmqpChannelPrivate::reserveWriteBytes(qint64 bytes)
+{
+    return client && client->d_func()->reserveWriteBytes(bytes);
+}
+
 void QAmqpChannelPrivate::resetInternalState()
 {
     flowActive = true;
@@ -127,7 +154,7 @@ void QAmqpChannelPrivate::flow(bool active)
 
     QAmqpMethodFrame frame(QAmqpFrame::Channel, miFlow);
     frame.setChannel(channelNumber);
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     sendFrame(frame);
 }
 
@@ -165,7 +192,7 @@ QAmqpMethodFrame QAmqpChannelPrivate::flowOkFrame(quint16 channelNumber, bool ac
 
     QAmqpMethodFrame frame(QAmqpFrame::Channel, miFlowOk);
     frame.setChannel(channelNumber);
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     return frame;
 }
 
@@ -209,7 +236,7 @@ void QAmqpChannelPrivate::close(int code, const QString &text, int classId, int 
 
     QAmqpMethodFrame frame(QAmqpFrame::Channel, miClose);
     frame.setChannel(channelNumber);
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     sendFrame(frame);
 }
 
@@ -362,7 +389,7 @@ void QAmqpChannel::qos(qint16 prefetchCount, qint32 prefetchSize)
     qAmqpDebug("<- basic#qos( channel=%d, name=%s, prefetch-size=%d, prefetch-count=%d, global=%d )",
                d->channelNumber, qPrintable(d->name), prefetchSize, prefetchCount, 0);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     d->sendFrame(frame);
 }
 

@@ -548,8 +548,9 @@ void tst_QAMQPQueue::invalidRoutingKey()
 {
     QString routingKey = QString("%1").arg('1', 256, QLatin1Char('0'));
     QAmqpQueue *queue = client->createQueue(routingKey);
+    QSignalSpy errors(client.data(), SIGNAL(error(QAMQP::Error)));
     queue->declare();
-    QVERIFY(waitForSignal(client.data(), SIGNAL(error(QAMQP::Error))));
+    QTRY_COMPARE(errors.count(), 1);
     QCOMPARE(client->error(), QAMQP::FrameError);
 }
 
@@ -617,9 +618,11 @@ void tst_QAMQPQueue::tableFieldDataTypes()
     headers.insert("bytes", QByteArray("abcdefg1234567"));
 
     QAmqpExchange *defaultExchange = client->createExchange();
-    defaultExchange->publish("dummy", "test-table-field-data-types", "text.plain", headers);
+    const QAmqpExchange::PublishResult result =
+        defaultExchange->publish("dummy", "test-table-field-data-types", "text.plain", headers);
+    QVERIFY(result == QAmqpExchange::AcceptedForWrite || result == QAmqpExchange::Queued);
 
-    QVERIFY(waitForSignal(queue, SIGNAL(messageReceived())));
+    QVERIFY2(waitForSignal(queue, SIGNAL(messageReceived())), qPrintable(client->errorString()));
     QAmqpMessage message = queue->dequeue();
 
     QCOMPARE(message.header("boolean").toBool(), true);

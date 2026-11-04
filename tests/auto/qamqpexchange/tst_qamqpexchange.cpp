@@ -213,6 +213,7 @@ void tst_QAMQPExchange::passiveDeclareNotFound()
 
 void tst_QAMQPExchange::cleanupOnDeletion()
 {
+    QSignalSpy errors(client.data(), SIGNAL(error(QAMQP::Error)));
     // create, declare, and close the wrong way
     QAmqpExchange *exchange = client->createExchange("test-deletion");
     exchange->declare();
@@ -227,6 +228,8 @@ void tst_QAMQPExchange::cleanupOnDeletion()
     QVERIFY(waitForSignal(exchange, SIGNAL(declared())));
     exchange->close();
     QVERIFY(waitForSignal(exchange, SIGNAL(closed())));
+    QCOMPARE(errors.count(), 0);
+    QVERIFY(client->isConnected());
 }
 
 void tst_QAMQPExchange::testQueuedPublish()

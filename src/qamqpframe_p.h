@@ -53,7 +53,8 @@ public:
     virtual qint32 size() const;
 
     static QVariant readAmqpField(QDataStream &s, QAmqpMetaType::ValueType type);
-    static void writeAmqpField(QDataStream &s, QAmqpMetaType::ValueType type, const QVariant &value);
+    static bool isValidShortString(const QString &value);
+    static bool writeAmqpField(QDataStream &s, QAmqpMetaType::ValueType type, const QVariant &value);
 
     // rejects wire-supplied lengths that are negative, exceed the sane frame cap, or
     // exceed what is actually left to read, before any resize()/allocation is attempted
@@ -89,7 +90,7 @@ public:
     virtual qint32 size() const;
 
     QByteArray arguments() const;
-    void setArguments(const QByteArray &data);
+    void setArguments(const QByteArray &data, QDataStream::Status status = QDataStream::Ok);
 
 private:
     void writePayload(QDataStream &stream) const;
@@ -98,6 +99,7 @@ private:
     short methodClass_;
     qint16 id_;
     QByteArray arguments_;
+    bool argumentsValid_;
 };
 
 class QAmqpContentFrame : public QAmqpFrame
@@ -124,6 +126,7 @@ private:
     short methodClass_;
     qint16 id_;
     mutable QByteArray buffer_;
+    mutable bool serializationValid_;
     QAmqpMessage::PropertyHash properties_;
     qlonglong bodySize_;
 };
