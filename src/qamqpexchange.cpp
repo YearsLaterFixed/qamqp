@@ -94,7 +94,7 @@ void QAmqpExchangePrivate::declare()
                options.testFlag(QAmqpExchange::Passive), options.testFlag(QAmqpExchange::Durable),
                options.testFlag(QAmqpExchange::NoWait));
 
-    frame.setArguments(args);
+    frame.setArguments(args, stream.status());
     sendFrame(frame);
     delayedDeclare = false;
 }
@@ -230,6 +230,7 @@ void QAmqpExchangePrivate::handleAckOrNack(const QAmqpMethodFrame &frame)
 QAmqpExchange::QAmqpExchange(int channelNumber, QAmqpClient *parent)
     : QAmqpChannel(new QAmqpExchangePrivate(this), parent)
 {
+    qRegisterMetaType<QAmqpExchange::PublishError>("QAmqpExchange::PublishError");
     Q_D(QAmqpExchange);
     d->init(channelNumber, parent);
 }
@@ -299,7 +300,7 @@ void QAmqpExchange::remove(int options)
     qAmqpDebug("<- exchange#delete( exchange=%s, if-unused=%d, no-wait=%d )",
                qPrintable(d->name), options & QAmqpExchange::roIfUnused, options & QAmqpExchange::roNoWait);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     d->sendFrame(frame);
 }
 
@@ -325,6 +326,25 @@ QAmqpExchange::PublishResult QAmqpExchange::publish(
     int publishOptions)
 {
     Q_D(QAmqpExchange);
+    if (!QAmqpFrame::isValidShortString(d->name) ||
+        !QAmqpFrame::isValidShortString(routingKey)) {
+        Q_EMIT publishRejected(InvalidShortString);
+        return RejectedInvalid;
+    }
+
+    QAmqpContentFrame validationFrame(QAmqpFrame::Basic);
+    validationFrame.setProperty(QAmqpMessage::ContentType, mimeType);
+    validationFrame.setProperty(QAmqpMessage::ContentEncoding, "utf-8");
+    validationFrame.setProperty(QAmqpMessage::Headers, headers);
+    QAmqpMessage::PropertyHash::ConstIterator validationIt;
+    QAmqpMessage::PropertyHash::ConstIterator validationEnd = properties.constEnd();
+    for (validationIt = properties.constBegin(); validationIt != validationEnd; ++validationIt)
+        validationFrame.setProperty(validationIt.key(), validationIt.value());
+    validationFrame.setBodySize(message.size());
+    if (validationFrame.size() < 0) {
+        Q_EMIT publishRejected(InvalidShortString);
+        return RejectedInvalid;
+    }
     if (message.size() > d->client->maxWriteQueueBytes())
         return RejectedLimit;
 
@@ -387,7 +407,7 @@ QByteArray QAmqpExchangePrivate::serializePublish(const PendingPublish &publish)
                publish.publishOptions & QAmqpExchange::poMandatory,
                publish.publishOptions & QAmqpExchange::poImmediate);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     stream << frame;
 
     QAmqpContentFrame content(QAmqpFrame::Basic);

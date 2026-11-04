@@ -382,7 +382,7 @@ void QAmqpQueuePrivate::declare()
                options & QAmqpQueue::Exclusive, options & QAmqpQueue::AutoDelete,
                options & QAmqpQueue::NoWait);
 
-    frame.setArguments(args);
+    frame.setArguments(args, out.status());
     sendFrame(frame);
 
     if (delayedDeclare)
@@ -570,7 +570,7 @@ void QAmqpQueue::remove(int options)
     qAmqpDebug("<- queue#delete( queue=%s, if-unused=%d, if-empty=%d )",
                qPrintable(d->name), options & QAmqpQueue::roIfUnused, options & QAmqpQueue::roIfEmpty);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -592,7 +592,7 @@ void QAmqpQueue::purge()
 
     qAmqpDebug("<- queue#purge( queue=%s, no-wait=%d )", qPrintable(d->name), 0);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -649,7 +649,7 @@ void QAmqpQueue::bind(const QString &exchangeName, const QString &key, bool noWa
                qPrintable(d->name), qPrintable(exchangeName), qPrintable(key),
                noWait);
 
-    frame.setArguments(frameArguments);
+    frame.setArguments(frameArguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -685,7 +685,7 @@ void QAmqpQueue::unbind(const QString &exchangeName, const QString &key)
     qAmqpDebug("<- queue#unbind( queue=%s, exchange=%s, routing-key=%s )",
                qPrintable(d->name), qPrintable(exchangeName), qPrintable(key));
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -725,7 +725,7 @@ bool QAmqpQueue::consume(int options)
                options & QAmqpQueue::coNoLocal, options & QAmqpQueue::coNoAck,
                options & QAmqpQueue::coExclusive, options & QAmqpQueue::coNoWait);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
     d->consumeRequested = true;
     return true;
@@ -775,7 +775,7 @@ void QAmqpQueue::get(bool noAck)
 
     qAmqpDebug("<- basic#get( queue=%s, no-ack=%d )", qPrintable(d->name), noAck);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
 }
 
@@ -859,7 +859,7 @@ bool QAmqpQueue::cancel(bool noWait)
 
     qAmqpDebug("<- basic#cancel( consumer-tag=%s, no-wait=%d )", qPrintable(d->consumerTag), noWait);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, out.status());
     d->sendFrame(frame);
     return true;
 }

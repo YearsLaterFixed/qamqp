@@ -89,7 +89,7 @@ accounting through inherited mutators.
 
 #### publish buffering and delivery
 `QAmqpExchange::publish()` returns a `PublishResult` describing local admission:
-`AcceptedForWrite`, `Queued`, `RejectedLimit`, or `NotConnected`. `Queued` and
+`AcceptedForWrite`, `Queued`, `RejectedLimit`, `NotConnected`, or `RejectedInvalid`. `Queued` and
 `AcceptedForWrite` do not mean the broker received or accepted the message; use
 publisher confirms when broker acknowledgement is required. A deferred publish
 queue is limited to 1,000 messages or 16 MiB of fully serialized data per
@@ -98,6 +98,9 @@ budget is 16 MiB and can be changed with `QAmqpClient::setMaxWriteQueueBytes()`.
 Setting the client budget to zero disables writes. Exceeding either limit is
 reported to the caller instead of silently dropping a publish. Writes are
 drained asynchronously, so a slow peer does not block the Qt event loop.
+Short strings exceeding 255 UTF-8 bytes are rejected before admission, without
+truncation or a write reservation. Invalid publishes return `RejectedInvalid`
+and emit `publishRejected(InvalidShortString)` once.
 
 AMQP Support
 ------------

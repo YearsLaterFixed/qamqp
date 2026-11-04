@@ -521,8 +521,13 @@ bool QAmqpClientPrivate::sendFrame(const QAmqpFrame &frame)
         return false;
     QDataStream stream(&buffer);
     stream << frame;
-    if (stream.status() != QDataStream::Ok)
+    if (stream.status() != QDataStream::Ok) {
+        Q_Q(QAmqpClient);
+        error = QAMQP::FrameError;
+        errorString = "AMQP frame contains an invalid field";
+        Q_EMIT q->error(error);
         return false;
+    }
     return sendFrameBatch(data);
 }
 
@@ -788,7 +793,7 @@ void QAmqpClientPrivate::startOk()
 
     authenticator->write(stream);
     QAmqpFrame::writeAmqpField(stream, QAmqpMetaType::ShortString, QLatin1String("en_US"));
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
 
     qAmqpDebug("<- connection#startOk()");  // @todo: fill this out
     sendFrame(frame);
@@ -830,7 +835,7 @@ void QAmqpClientPrivate::open()
     qAmqpDebug("<- connection#open( virtualHost=%s, reserved-1=%d, reserved-2=%d )",
                qPrintable(virtualHost), 0, 0);
 
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     sendFrame(frame);
 }
 
@@ -847,7 +852,7 @@ void QAmqpClientPrivate::close(int code, const QString &text, int classId, int m
                code, qPrintable(text), classId, methodId);
 
     QAmqpMethodFrame frame(QAmqpFrame::Connection, QAmqpClientPrivate::miClose);
-    frame.setArguments(arguments);
+    frame.setArguments(arguments, stream.status());
     sendFrame(frame);
 }
 
