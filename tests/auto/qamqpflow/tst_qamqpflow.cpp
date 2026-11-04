@@ -2,6 +2,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QSslSocket>
+#include <QTimer>
 
 #include "qamqpchannel.h"
 #include "qamqpchannel_p.h"
@@ -47,6 +48,12 @@ private Q_SLOTS:
     void pendingPublishAdmission();
     void writeQueueReservation();
     void asynchronousWriteQueue();
+    void controlFramesHaveIndependentBudget();
+    void controlFramesRespectPublishSequence();
+    void partialControlFrameCannotBeInterrupted();
+    void controlReserveExhaustionIsObservable();
+    void controlWriteTimeoutIsObservable();
+    void saturatedBudgetAllowsStartupAndReconnect();
     void writeQueueDiscardOnDisconnect();
     void flowStateResetOnReconnect();
 };
@@ -199,6 +206,272 @@ void tst_QAMQPFlow::asynchronousWriteQueue()
     QTRY_COMPARE(peer->bytesAvailable(), qint64(3));
     QCOMPARE(peer->readAll(), QByteArray("abc"));
     QTRY_COMPARE(writer.bufferedWriteBytes, qint64(0));
+}
+
+void tst_QAMQPFlow::controlFramesHaveIndependentBudget()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QAmqpClient client;
+    QAmqpClientPrivate writer(&client);
+    writer.socket = new QSslSocket(&client);
+    writer.maxWriteQueueBytes = 1;
+    QObject::connect(writer.socket, &QIODevice::bytesWritten, &client,
+                     [&writer](qint64 bytes) { writer._q_bytesWritten(bytes); });
+    QSignalSpy connected(writer.socket, &QAbstractSocket::connected);
+    writer.socket->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    QVERIFY(connected.wait(1000));
+    QTRY_VERIFY(server.hasPendingConnections());
+    QTcpSocket *peer = server.nextPendingConnection();
+    QVERIFY(peer);
+
+    QVERIFY(writer.reserveWriteBytes(1));
+    QAmqpHeartbeatFrame heartbeat;
+    QVERIFY(writer.sendFrame(heartbeat));
+    QTRY_COMPARE(peer->bytesAvailable(), qint64(8));
+    QCOMPARE(peer->readAll().toHex(), QByteArray("08000000000000ce"));
+    QCOMPARE(writer.bufferedWriteBytes, qint64(1));
+    QVERIFY(!writer.sendFrameBatch(QByteArray("x")));
+
+    writer.releaseWriteBytes(1);
+    QVERIFY(writer.sendFrameBatch(QByteArray("x")));
+    QTRY_COMPARE(peer->bytesAvailable(), qint64(1));
+    QCOMPARE(peer->readAll(), QByteArray("x"));
+    QTRY_COMPARE(writer.bufferedWriteBytes, qint64(0));
+}
+
+class PartialWriteSocket : public QSslSocket
+{
+public:
+    explicit PartialWriteSocket(QObject *parent) : QSslSocket(parent), maximumWriteSize(4093) {}
+    qint64 maximumWriteSize;
+
+protected:
+    qint64 writeData(const char *data, qint64 bytes) override
+    {
+        return maximumWriteSize ? QSslSocket::writeData(data, qMin(bytes, maximumWriteSize)) : 0;
+    }
+};
+
+class ControlTestClient : public QAmqpClient
+{
+public:
+    QAmqpClientPrivate *state() { return d_func(); }
+};
+
+static QTcpSocket *connectControlWriter(ControlTestClient &client, QTcpServer &server)
+{
+    if (!server.isListening() && !server.listen(QHostAddress::LocalHost, 0))
+        return nullptr;
+    QAmqpClientPrivate *writer = client.state();
+    delete writer->socket;
+    writer->socket = new PartialWriteSocket(&client);
+    QObject::connect(writer->socket, &QIODevice::bytesWritten, &client,
+                     [writer](qint64 bytes) { writer->_q_bytesWritten(bytes); });
+    QObject::connect(writer->socket, &QAbstractSocket::disconnected, &client,
+                     [writer] { writer->_q_socketDisconnected(); });
+    writer->socket->connectToHost(QHostAddress::LocalHost, server.serverPort());
+    if (!writer->socket->waitForConnected(1000))
+        return nullptr;
+    if (!server.hasPendingConnections() && !server.waitForNewConnection(1000))
+        return nullptr;
+    return server.nextPendingConnection();
+}
+
+static QByteArray encodeFrame(const QAmqpFrame &frame)
+{
+    QByteArray bytes;
+    QDataStream stream(&bytes, QIODevice::WriteOnly);
+    stream << frame;
+    return bytes;
+}
+
+void tst_QAMQPFlow::controlFramesRespectPublishSequence()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+
+    QAmqpMethodFrame publish(QAmqpFrame::Basic, 40);
+    publish.setChannel(1);
+    QByteArray arguments;
+    QDataStream publishArguments(&arguments, QIODevice::WriteOnly);
+    publishArguments << quint16(0);
+    QAmqpFrame::writeAmqpField(publishArguments, QAmqpMetaType::ShortString, "exchange");
+    QAmqpFrame::writeAmqpField(publishArguments, QAmqpMetaType::ShortString, "route");
+    publishArguments << quint8(0);
+    publish.setArguments(arguments);
+    QAmqpContentFrame content(QAmqpFrame::Basic);
+    content.setChannel(1);
+    content.setBodySize(71 * 1024);
+    QAmqpContentBodyFrame largeBody;
+    largeBody.setChannel(1);
+    largeBody.setBody(QByteArray(70 * 1024, 'a'));
+    QAmqpContentBodyFrame smallBody;
+    smallBody.setChannel(1);
+    smallBody.setBody(QByteArray(1024, 'b'));
+    const QByteArray prefix = encodeFrame(publish) + encodeFrame(content) + encodeFrame(largeBody);
+    const QByteArray suffix = encodeFrame(smallBody);
+    QVERIFY(writer.sendFrameBatch(prefix + suffix));
+    QVERIFY(!writer.pendingWrites.isEmpty());
+    QVERIFY(writer.pendingWrites.head().offset < writer.pendingWrites.head().frameEnd);
+
+    const QAmqpMethodFrame sameChannel = QAmqpChannelPrivate::flowOkFrame(1, true);
+    const QAmqpMethodFrame otherChannel = QAmqpChannelPrivate::flowOkFrame(2, true);
+    QAmqpHeartbeatFrame heartbeat;
+    QVERIFY(writer.sendFrame(sameChannel));
+    QVERIFY(writer.sendFrame(otherChannel));
+    QVERIFY(writer.sendFrame(heartbeat));
+    QVERIFY(writer.sendFrameBatch(prefix + suffix));
+    const QByteArray expected = prefix + encodeFrame(otherChannel) + encodeFrame(heartbeat) +
+        suffix + encodeFrame(sameChannel) + prefix + suffix;
+    bool eventLoopServiced = false;
+    QTimer::singleShot(0, &client, [&eventLoopServiced] { eventLoopServiced = true; });
+    QTRY_COMPARE(peer->bytesAvailable(), qint64(expected.size()));
+    QCOMPARE(peer->readAll(), expected);
+    QVERIFY(eventLoopServiced);
+    QTRY_COMPARE(writer.bufferedWriteBytes, qint64(0));
+    QTRY_COMPARE(writer.bufferedControlBytes, qint64(0));
+}
+
+void tst_QAMQPFlow::partialControlFrameCannotBeInterrupted()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QTcpSocket *peer = connectControlWriter(client, server);
+    QVERIFY(peer);
+
+    QAmqpContentBodyFrame firstBody;
+    firstBody.setChannel(1);
+    firstBody.setBody(QByteArray(60 * 1024, 'a'));
+    QAmqpMethodFrame control(QAmqpFrame::Connection, QAmqpClientPrivate::miStartOk);
+    control.setArguments(QByteArray(16 * 1024, 'c'));
+    QAmqpContentBodyFrame secondBody;
+    secondBody.setChannel(2);
+    secondBody.setBody(QByteArray(1024, 'b'));
+    QAmqpHeartbeatFrame heartbeat;
+    QVERIFY(writer.sendFrameBatch(encodeFrame(firstBody)));
+    QVERIFY(writer.sendFrame(control));
+    QVERIFY(!writer.controlWrites.isEmpty());
+    QVERIFY(writer.controlWrites.head().offset > 0);
+    QVERIFY(writer.controlWrites.head().offset < writer.controlWrites.head().data.size());
+    QVERIFY(writer.sendFrameBatch(encodeFrame(secondBody)));
+    QVERIFY(writer.sendFrame(heartbeat));
+    const QByteArray expected = encodeFrame(firstBody) + encodeFrame(control) +
+        encodeFrame(heartbeat) + encodeFrame(secondBody);
+    QTRY_COMPARE(peer->bytesAvailable(), qint64(expected.size()));
+    QCOMPARE(peer->readAll(), expected);
+    QTRY_COMPARE(writer.bufferedWriteBytes, qint64(0));
+    QTRY_COMPARE(writer.bufferedControlBytes, qint64(0));
+}
+
+void tst_QAMQPFlow::controlReserveExhaustionIsObservable()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QVERIFY(connectControlWriter(client, server));
+    client.setAutoReconnect(true);
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    QAmqpMethodFrame control(QAmqpFrame::Connection, QAmqpClientPrivate::miStartOk);
+    control.setArguments(QByteArray(QAmqpClientPrivate::ControlWriteQueueBytes - 12, 'c'));
+    QVERIFY(writer.sendFrame(control));
+    QCOMPARE(writer.bufferedControlBytes, qint64(QAmqpClientPrivate::ControlWriteQueueBytes));
+    QAmqpHeartbeatFrame heartbeat;
+    QVERIFY(!writer.sendFrame(heartbeat));
+    QCOMPARE(errors.count(), 1);
+    QCOMPARE(client.error(), QAMQP::ResourceError);
+    QCOMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+    QCOMPARE(writer.bufferedControlBytes, qint64(0));
+    QVERIFY(writer.reconnectTimer->isActive());
+    writer.reconnectTimer->stop();
+}
+
+void tst_QAMQPFlow::controlWriteTimeoutIsObservable()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    QVERIFY(connectControlWriter(client, server));
+    static_cast<PartialWriteSocket *>(writer.socket)->maximumWriteSize = 0;
+    client.setAutoReconnect(true);
+    QSignalSpy errors(&client, SIGNAL(error(QAMQP::Error)));
+    QAmqpHeartbeatFrame heartbeat;
+    QVERIFY(writer.sendFrame(heartbeat));
+    writer.controlWriteTimer->start(1);
+    QTRY_COMPARE(errors.count(), 1);
+    QCOMPARE(client.error(), QAMQP::ResourceError);
+    QCOMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+    QCOMPARE(writer.bufferedControlBytes, qint64(0));
+    QVERIFY(writer.reconnectTimer->isActive());
+    writer.reconnectTimer->stop();
+}
+
+void tst_QAMQPFlow::saturatedBudgetAllowsStartupAndReconnect()
+{
+    int argc = 0;
+    char *argv[] = {nullptr};
+    QCoreApplication app(argc, argv);
+    QTcpServer server;
+    ControlTestClient client;
+    QAmqpClientPrivate &writer = *client.state();
+    writer.maxWriteQueueBytes = 1;
+    QVERIFY(writer.reserveWriteBytes(1));
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        QTcpSocket *peer = connectControlWriter(client, server);
+        QVERIFY(peer);
+        writer._q_socketConnected();
+        writer.tuneOk();
+        writer.open();
+        QAmqpMethodFrame channelOpen(QAmqpFrame::Channel, QAmqpChannelPrivate::miOpen);
+        channelOpen.setChannel(1);
+        channelOpen.setArguments(QByteArray(1, char(0)));
+        QVERIFY(writer.sendFrame(channelOpen));
+        QAmqpHeartbeatFrame heartbeat;
+        QVERIFY(writer.sendFrame(heartbeat));
+
+        QAmqpMethodFrame tuneOk(QAmqpFrame::Connection, QAmqpClientPrivate::miTuneOk);
+        QByteArray tuneArguments;
+        QDataStream tuneStream(&tuneArguments, QIODevice::WriteOnly);
+        tuneStream << quint16(writer.channelMax) << qint32(writer.frameMax)
+                   << quint16(writer.heartbeatDelay);
+        tuneOk.setArguments(tuneArguments);
+        QAmqpMethodFrame connectionOpen(QAmqpFrame::Connection, QAmqpClientPrivate::miOpen);
+        QByteArray openArguments;
+        QDataStream openStream(&openArguments, QIODevice::WriteOnly);
+        QAmqpFrame::writeAmqpField(openStream, QAmqpMetaType::ShortString, writer.virtualHost);
+        openStream << quint8(0) << quint8(0);
+        connectionOpen.setArguments(openArguments);
+        const QByteArray expected = QByteArray("AMQP\0\0\x09\x01", 8) + encodeFrame(tuneOk) +
+            encodeFrame(connectionOpen) + encodeFrame(channelOpen) + encodeFrame(heartbeat);
+        QTRY_COMPARE(peer->bytesAvailable(), qint64(expected.size()));
+        QCOMPARE(peer->readAll(), expected);
+        QTRY_COMPARE(writer.bufferedControlBytes, qint64(0));
+        QCOMPARE(writer.bufferedWriteBytes, qint64(1));
+        peer->abort();
+        QTRY_COMPARE(writer.socket->state(), QAbstractSocket::UnconnectedState);
+        QCOMPARE(writer.bufferedWriteBytes, qint64(1));
+    }
+    writer.releaseWriteBytes(1);
 }
 
 void tst_QAMQPFlow::writeQueueDiscardOnDisconnect()
